@@ -1,0 +1,7 @@
+# Config termostato - esempio
+# Copiare su microSD come /config.txt e modificare i valori dopo =
+title=TITLE
+ssid=SSID
+pass=PASSWORD
+antigelo=5.0
+brightness=255

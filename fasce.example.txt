@@ -1,0 +1,6 @@
+# Fasce orarie termostato - esempio
+# Copiare su microSD come /fasce.txt
+# Formato: fascia=oraInizio,minInizio,oraFine,minFine
+version=1
+fascia=8,0,12,30
+fascia=18,0,22,0
