@@ -1,6 +1,10 @@
-# Termostato 2 FIX
+# Termostato
 
 Progetto PlatformIO/Arduino C++ per termostato touch basato su ESP32-S3 con display GUITION/Sunton ESP32-8048S050 5" 800x480.
+
+Ho creato questo progetto utilizzando PlatforIO e IA perchè mi serviva in casa. Ho deciso di pubblicarlo per non perdere i files e perchè qualcuno potrebbe trovarlo utile.
+Il progetto è in ITALIANO, sentitevi liberi di tradurlo.
+
 
 ## Stato progetto
 
@@ -16,11 +20,11 @@ Versione stabile attuale: `main.cpp` basato sulla release con fix luminosità al
 - Web server per controllo da PC/smartphone.
 - Fallback Access Point se il Wi-Fi domestico non è disponibile.
 - Configurazione persistente su microSD.
-- Menu impostazioni `TITLE`.
+- Menu impostazioni con tasto personalizzabile `TITLE`.
 - Luminosità regolabile.
 - Protezione antigelo regolabile.
-- Ottimizzazioni RAM: schermate secondarie create solo quando servono.
-- Salvataggi SD ottimizzati all'uscita dai menu.
+- Ottimizzazioni RAM.
+- Salvataggi SD ottimizzati.
 
 ## Hardware
 
@@ -49,21 +53,6 @@ Password: 12345678
 Indirizzo: http://192.168.4.1
 ```
 
-## File da non pubblicare
-
-Non pubblicare file con credenziali reali o file generati automaticamente.
-
-Da ignorare:
-
-```text
-.pio/
-config.txt
-fasce.txt
-secrets.h
-wifi_credentials.h
-.env
-```
-
 ## Configurazione SD
 
 Esempio `/config.txt` sulla microSD:
@@ -84,30 +73,8 @@ fascia=8,0,12,30
 fascia=18,0,22,0
 ```
 
-## Compilazione
-
-Da terminale nella root del progetto:
-
-```bash
-pio run
-```
-
-Upload su ESP32-S3:
-
-```bash
-pio run --target upload
-```
-
-Monitor seriale:
-
-```bash
-pio device monitor
-```
-
 ## Note importanti
 
 - Non modificare la configurazione LovyanGFX se il display è stabile.
-- Nel progetto è stata usata una frequenza display conservativa per evitare flickering.
+- Nel progetto è stata usata una frequenza display conservativa (15MHz) per evitare flickering.
 - BME280 e relè sono disattivati di default se non collegati.
-- Il valore di luminosità minima è circa 17%.
-- Il display, dopo spegnimento per inattività, si riattiva alla luminosità impostata.
