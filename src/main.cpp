@@ -48,8 +48,8 @@ bool overrideManuale = false;
 
 // Pin I2C dedicati al BME280. Da verificare sul pinout effettivo del tuo GUITION.
 // Se la tua scheda espone altri pin liberi, puoi cambiarli qui senza toccare la logica.
-#define PIN_BME_SDA 18
-#define PIN_BME_SCL 22
+#define PIN_BME_SDA 17
+#define PIN_BME_SCL 18
 #define BME_ADDR_PRIMARY   0x76
 #define BME_ADDR_SECONDARY 0x77
 
