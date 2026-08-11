@@ -39,7 +39,7 @@ bool overrideManuale = false;
 // BME280 e relè sono disattivati di default perché al momento non sono ancora collegati.
 // Quando colleghi i componenti, imposta a 1 solo il modulo che vuoi testare.
 #define USE_RELE    0
-#define USE_BME280  0
+#define USE_BME280  1
 
 // ATTENZIONE: non usare GPIO 4 per il relè sul display ESP32-8048S050, perché è una linea RGB del display.
 // Usa un GPIO realmente esposto e libero sulla tua scheda. GPIO17 è una scelta iniziale prudente, da verificare sul tuo pinout.
