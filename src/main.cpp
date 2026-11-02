@@ -189,7 +189,9 @@ AsyncWebServer server(80);
 bool webServerAvviato = false;
 bool apFallbackAttivo = false;
 const char* WEB_AP_SSID = "Termostato";
-const char* WEB_AP_PASS = "12345678";
+char webApPass[64] = "";
+unsigned long wifiDisconnessoDaMs = 0;
+const unsigned long AP_FALLBACK_GRACE_MS = 30000UL; // 30s di tolleranza prima di accendere l'AP se il WiFi cade
 bool sdPronta = false;
 bool ntpConfigurato = false;
 
@@ -806,13 +808,22 @@ void aggiornaBadgeStato() {
 }
 
 
+void inizializzaCredenzialiAPDefault() {
+  if (strlen(webApPass) >= 8) return;
+  uint64_t mac = ESP.getEfuseMac();
+  uint32_t tail = (uint32_t)((mac >> 24) & 0xFFFFFFULL) ^ (uint32_t)(mac & 0xFFFFFFULL);
+  snprintf(webApPass, sizeof(webApPass), "Termo-%06lX", (unsigned long)(tail & 0xFFFFFFUL));
+}
+
 void attivaAccessPointWeb() {
   if (apFallbackAttivo) return;
+
+  inizializzaCredenzialiAPDefault();
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
 
-  bool ok = WiFi.softAP(WEB_AP_SSID, WEB_AP_PASS);
+  bool ok = WiFi.softAP(WEB_AP_SSID, webApPass);
 
   apFallbackAttivo = ok;
 
@@ -840,11 +851,28 @@ void disattivaAccessPointWeb() {
 
 void assicuraAccessoWeb() {
   if (WiFi.status() == WL_CONNECTED) {
+    wifiDisconnessoDaMs = 0;
     disattivaAccessPointWeb();
     return;
   }
 
-  if (!wifiConnessioneInCorso) {
+  if (wifiConnessioneInCorso) return;
+
+  // Se non c'è alcuna rete WiFi configurata, accendiamo subito l'AP di configurazione.
+  if (!ssidConfiguratoValido(String(ssid))) {
+    attivaAccessPointWeb();
+    return;
+  }
+
+  // Se invece una rete WiFi è configurata ma il router si è momentaneamente disconnesso,
+  // attendiamo AP_FALLBACK_GRACE_MS (30s) per permettere l'auto-reconnect prima di esporre l'AP.
+  unsigned long now = millis();
+  if (wifiDisconnessoDaMs == 0) {
+    wifiDisconnessoDaMs = (now == 0) ? 1 : now;
+    return;
+  }
+
+  if (now - wifiDisconnessoDaMs >= AP_FALLBACK_GRACE_MS) {
     attivaAccessPointWeb();
   }
 }
@@ -1368,7 +1396,7 @@ String mascheraPasswordInConfig(const String& raw) {
     if (!trimmed.startsWith("#") && eq > 0) {
       String key = trimmed.substring(0, eq);
       key.trim();
-      if (key == "pass" || key == "web_pass") {
+      if (key == "pass" || key == "web_pass" || key == "ap_pass") {
         String val = trimmed.substring(eq + 1);
         val.trim();
         out += key;
@@ -1672,6 +1700,7 @@ bool saveConfig() {
   }
 
   tempAntigelo = constrain(tempAntigelo, ANTIGELO_MIN, ANTIGELO_MAX);
+  inizializzaCredenzialiAPDefault();
 
   String content = "";
   content += "# Config termostato\n";
@@ -1681,6 +1710,7 @@ bool saveConfig() {
   content += "pass=" + String(password) + "\n";
   content += "web_user=" + String(webUser) + "\n";
   content += "web_pass=" + String(webPass) + "\n";
+  content += "ap_pass=" + String(webApPass) + "\n";
   content += "antigelo=" + String(tempAntigelo, 1) + "\n";
   content += "brightness=" + String(displayBrightness) + "\n";
 
@@ -1759,6 +1789,13 @@ void loadConfig() {
       if (value.length() > 0) {
         value.toCharArray(webPass, sizeof(webPass));
       }
+    } else if (key == "ap_pass") {
+      // WPA2 richiede almeno 8 caratteri
+      if (value.length() >= 8 && value.length() <= 63) {
+        value.toCharArray(webApPass, sizeof(webApPass));
+      } else {
+        riscriviConfig = true;
+      }
     } else if (key == "antigelo") {
       float parsed = 0.0f;
 
@@ -1794,6 +1831,7 @@ void loadConfig() {
 
   tempAntigelo = constrain(tempAntigelo, ANTIGELO_MIN, ANTIGELO_MAX);
   displayBrightness = constrain(displayBrightness, DISPLAY_BRIGHTNESS_MIN, DISPLAY_BRIGHTNESS_MAX);
+  inizializzaCredenzialiAPDefault();
   sdConfigCaricataOk = true;
 
   Serial.print("SD OK: config caricata. title=");
@@ -2160,14 +2198,21 @@ void mostraListaWifiInizialeRapida() {
     lv_roller_set_visible_row_count(wifi_network_roller, 1);
   }
 
-  char msg[180];
+  char msg[220];
   if (ssidConfiguratoValido(reteSalvata)) {
-    snprintf(msg, sizeof(msg),
-             "Menu WiFi pronto.\nAttuale: %s",
-             reteSalvata.c_str());
+    if (apFallbackAttivo) {
+      snprintf(msg, sizeof(msg),
+               "AP: %s  Pass: %s\nAttuale: %s",
+               WEB_AP_SSID, webApPass, reteSalvata.c_str());
+    } else {
+      snprintf(msg, sizeof(msg),
+               "Menu WiFi pronto.\nAttuale: %s",
+               reteSalvata.c_str());
+    }
   } else {
     snprintf(msg, sizeof(msg),
-             "Menu WiFi pronto.\nAvvio scansione rapida...");
+             "AP: %s  Pass: %s\nAvvio scansione rapida...",
+             WEB_AP_SSID, webApPass);
   }
 
   lv_label_set_text(wifi_modal_status_label, msg);
@@ -2251,15 +2296,21 @@ void finalizzaRisultatiScansioneWifi(int n) {
   if (n <= 0) {
     lv_label_set_text(wifi_modal_status_label, "Scansione vuota.\nMostro solo la rete connessa.");
   } else {
-    char msg[220];
+    char msg[240];
     if (ssidConfiguratoValido(reteSalvata)) {
-      snprintf(msg, sizeof(msg),
-               "Trovate %d reti.\nAttuale: %s",
-               n, reteSalvata.c_str());
+      if (apFallbackAttivo) {
+        snprintf(msg, sizeof(msg),
+                 "Trovate %d reti. AP Pass: %s\nAttuale: %s",
+                 n, webApPass, reteSalvata.c_str());
+      } else {
+        snprintf(msg, sizeof(msg),
+                 "Trovate %d reti.\nAttuale: %s",
+                 n, reteSalvata.c_str());
+      }
     } else {
       snprintf(msg, sizeof(msg),
-               "Trovate %d reti.\nInserisci password.",
-               n);
+               "Trovate %d reti. AP Pass: %s\nInserisci password WiFi.",
+               n, webApPass);
     }
 
     lv_label_set_text(wifi_modal_status_label, msg);
@@ -4249,6 +4300,7 @@ String buildLoginHtml(const char* errorMsg = nullptr) {
 
 void setup() {
   Serial.begin(115200);
+  inizializzaCredenzialiAPDefault();
 
   if (inizializzaSD()) {
     loadConfig();
