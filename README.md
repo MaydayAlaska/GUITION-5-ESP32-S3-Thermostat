@@ -12,7 +12,8 @@ Il progetto è in **ITALIANO**, sentitevi liberi di tradurlo.
 Versione stabile, ottimizzata e messa in sicurezza:
 - **Zero sfarfallio / tremolio orizzontale (Anti-Jitter GDMA):** flush LVGL in `IRAM_ATTR` a micro-blocchi da 32 pixel (64 byte = 1 cache line) con `Cache_WriteBack_Addr` e `LV_COLOR_16_SWAP 1`, studiato per non svuotare mai la FIFO L2 GDMA dell'ESP32-S3 durante il refresh del pannello RGB a 16 MHz.
 - **Web Server asincrono (`ESPAsyncWebServer`) protetto da Login:** autenticazione con sessione via Cookie a 128 bit (`HttpOnly`, `SameSite=Strict`), HTTP Basic Auth per API/domotica, protezione anti brute-force e comandi di stato su `HTTP_POST`.
-- **Thread-Safety Dual-Core:** tutte le operazioni LVGL e SPI/microSD richieste dal Web Server (Core 0 / `async_tcp`) sono delegate in modo sicuro al `loop()` principale (Core 1) o servite da cache in RAM.
+- **Integrazione nativa Home Assistant (MQTT Auto-Discovery):** client MQTT asincrono (`AsyncMqttClient-esphome`) che registra automaticamente in Home Assistant il controllo Clima (`climate`), i sensori di Temperatura, Umidità, Pressione e la Soglia Antigelo, senza bisogno di scrivere YAML e mantenendo il funzionamento autonomo locale.
+- **Thread-Safety Dual-Core:** tutte le operazioni LVGL e SPI/microSD richieste dal Web Server o da MQTT (Core 0 / `async_tcp`) sono delegate in modo sicuro al `loop()` principale (Core 1) o servite da cache in RAM.
 - **Sicurezza Fisica Caldaia:** Watchdog Hardware (`esp_task_wdt` a 15s) contro blocchi del firmware, spegnimento immediato Fail-Safe del relè all'avvio e blocco a tempo di compilazione (`#error`) contro conflitti di pin tra relè e bus I2C.
 
 ---
@@ -79,8 +80,33 @@ Quando il termostato è connesso alla rete Wi-Fi di casa, nel riquadro in alto a
 | `/on` | `POST` | Accende manualmente il termostato |
 | `/off` | `POST` | Spegne manualmente il termostato |
 | `/stato` | `GET` | Restituisce lo stato attuale in formato JSON (supporta anche HTTP Basic Auth) |
+| `/mqtt-config` | `POST` | Salva e applica al volo le impostazioni del broker MQTT per Home Assistant |
 | `/sd` | `GET` | Diagnostica microSD (con password automaticamente oscurate `********`) |
 | `/sd-init` | `POST` | Richiede la reinizializzazione sicura della microSD nel loop principale |
+
+---
+
+## Integrazione con Home Assistant (MQTT Auto-Discovery)
+
+Il termostato integra il protocollo **Home Assistant MQTT Auto-Discovery** (tramite `AsyncMqttClient-esphome`). Non serve riscrivere il firmware in ESPHome né configurare file YAML in Home Assistant:
+
+### Come attivarlo
+1. Assicurati di avere un broker MQTT attivo in Home Assistant (es. componente aggiuntivo **Mosquitto broker** e integrazione **MQTT** configurata).
+2. Entra nel pannello web del termostato (`http://<IP-DEL-TERMOSTATO>`), apri la tendina **"Home Assistant (MQTT)"** e inserisci:
+   - **Host / IP Broker MQTT:** l'indirizzo IP del tuo Home Assistant (es. `192.168.1.100`). Lascia vuoto per disattivare MQTT.
+   - **Porta:** `1883` (default).
+   - **Utente / Password MQTT:** le credenziali del tuo broker MQTT.
+3. Premi **Salva e Connetti MQTT** (oppure imposta `mqtt_host`, `mqtt_port`, `mqtt_user`, `mqtt_pass` direttamente in `/config.txt`).
+
+### Entità create automaticamente in Home Assistant
+Appena connesso al broker, il termostato compare da solo in **Impostazioni → Dispositivi e servizi → MQTT** come dispositivo unico con 5 entità:
+- **Clima (`climate`):** termostato completo (`off` / `heat`, stato reale `heating` / `idle` / `off`, regolazione temperatura target da `5.0 °C` a `30.0 °C` a passi di `0.5 °C`).
+- **Temperatura (`sensor`):** temperatura ambiente attuale in `°C`.
+- **Umidità (`sensor`):** umidità relativa in `%`.
+- **Pressione (`sensor`):** pressione atmosferica in `hPa`.
+- **Soglia Antigelo (`number`):** permette di leggere e modificare da Home Assistant la soglia antigelo (`0.5 °C` – `10.0 °C`) salvandola su microSD.
+
+> **Funzionamento autonomo (Fail-Safe):** anche se Home Assistant o il broker MQTT vengono spenti, il termostato continua a funzionare normalmente in locale seguendo il sensore BME280, le fasce orarie su microSD e la protezione antigelo.
 
 ---
 
@@ -116,14 +142,19 @@ pass=PasswordWiFi
 web_user=admin
 web_pass=termostato
 ap_pass=Termo-XXXXXX
+mqtt_host=192.168.1.100
+mqtt_port=1883
+mqtt_user=utente_mqtt
+mqtt_pass=password_mqtt
 antigelo=5.0
 brightness=255
 ```
 
-- `title`: Nome mostrato in alto a sinistra sul display e nella pagina web.
+- `title`: Nome mostrato in alto a sinistra sul display, nella pagina web e come nome dispositivo in Home Assistant.
 - `ssid` / `pass`: Credenziali della rete Wi-Fi domestica.
 - `web_user` / `web_pass`: Utente e password per il login sul pannello Web (`/`).
 - `ap_pass`: Password WPA2 (tra 8 e 63 caratteri) della rete Wi-Fi di emergenza `Termostato`. Se omessa o più corta di 8 caratteri, viene rigenerata automaticamente nel formato `Termo-XXXXXX`.
+- `mqtt_host` / `mqtt_port` / `mqtt_user` / `mqtt_pass`: Parametri del broker MQTT per Home Assistant Auto-Discovery (se `mqtt_host` è vuoto, MQTT resta disattivato).
 - `antigelo`: Temperatura minima di sicurezza in `°C` (da `0.5` a `10.0`).
 - `brightness`: Luminosità schermo da `43` (17%) a `255` (100%).
 

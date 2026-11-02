@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
+#include <AsyncMqttClient.h>
 #include <LovyanGFX.hpp>
 #include <lgfx_user/LGFX_Sunton_ESP32-8048S050.h>
 #include <lvgl.h>
@@ -19,6 +20,10 @@ char password[64]   = "PASSWORD";
 char titleLabel[64] = "TITLE";
 char webUser[32]    = "admin";
 char webPass[64]    = "termostato";
+char mqttHost[64]   = "";
+uint16_t mqttPort   = 1883;
+char mqttUser[32]   = "";
+char mqttPass[64]   = "";
 char webSessionToken[33] = "";
 unsigned long webSessionLastSeenMs = 0;
 const unsigned long WEB_SESSION_TIMEOUT_MS = 3600000UL; // 1 ora
@@ -193,6 +198,20 @@ const unsigned long TARGET_LOGIC_DEBOUNCE_MS = 140;
 const unsigned long TARGET_UI_MIN_INTERVAL_MS = 32;
 volatile bool webSyncPending = false;
 volatile bool webSdReinitPending = false;
+volatile bool webMqttSavePending = false;
+
+AsyncMqttClient mqttClient;
+bool mqttConnesso = false;
+bool mqttStateDirty = true;
+unsigned long ultimoTentativoMqttMs = 0;
+unsigned long ultimoPublishMqttMs = 0;
+char mqttNodeId[32] = "";
+char mqttTopicAvail[64] = "";
+char mqttTopicState[64] = "";
+char mqttTopicCmdMode[64] = "";
+char mqttTopicCmdTemp[64] = "";
+char mqttTopicCmdAntigelo[64] = "";
+void pubblicaStatoMqtt(bool force = false);
 
 AsyncWebServer server(80);
 bool webServerAvviato = false;
@@ -1408,12 +1427,12 @@ String mascheraPasswordInConfig(const String& raw) {
     if (!trimmed.startsWith("#") && eq > 0) {
       String key = trimmed.substring(0, eq);
       key.trim();
-      if (key == "pass" || key == "web_pass" || key == "ap_pass") {
+      if (key == "pass" || key == "web_pass" || key == "ap_pass" || key == "mqtt_pass") {
         String val = trimmed.substring(eq + 1);
         val.trim();
         out += key;
         out += "=";
-        out += (key == "pass" && passwordPlaceholder(val)) ? "(non configurata)" : "********";
+        out += ((key == "pass" && passwordPlaceholder(val)) || val.length() == 0) ? "(non configurata)" : "********";
         if (nl >= 0) out += '\n';
         start = (nl >= 0) ? (nl + 1) : len;
         continue;
@@ -1743,6 +1762,10 @@ bool saveConfig() {
   content += "web_user=" + String(webUser) + "\n";
   content += "web_pass=" + String(webPass) + "\n";
   content += "ap_pass=" + String(webApPass) + "\n";
+  content += "mqtt_host=" + String(mqttHost) + "\n";
+  content += "mqtt_port=" + String(mqttPort) + "\n";
+  content += "mqtt_user=" + String(mqttUser) + "\n";
+  content += "mqtt_pass=" + String(mqttPass) + "\n";
   content += "antigelo=" + String(tempAntigelo, 1) + "\n";
   content += "brightness=" + String(displayBrightness) + "\n";
 
@@ -1828,6 +1851,19 @@ void loadConfig() {
       } else {
         riscriviConfig = true;
       }
+    } else if (key == "mqtt_host") {
+      value.toCharArray(mqttHost, sizeof(mqttHost));
+    } else if (key == "mqtt_port") {
+      int parsedPort = 1883;
+      if (stringToIntStrict(value, parsedPort) && parsedPort >= 1 && parsedPort <= 65535) {
+        mqttPort = (uint16_t)parsedPort;
+      } else {
+        mqttPort = 1883;
+      }
+    } else if (key == "mqtt_user") {
+      value.toCharArray(mqttUser, sizeof(mqttUser));
+    } else if (key == "mqtt_pass") {
+      value.toCharArray(mqttPass, sizeof(mqttPass));
     } else if (key == "antigelo") {
       float parsed = 0.0f;
 
@@ -4330,6 +4366,279 @@ String buildLoginHtml(const char* errorMsg = nullptr) {
   return html;
 }
 
+// ── Home Assistant MQTT Auto-Discovery ────────────────────────
+bool mqttConfigurato() {
+  String h = String(mqttHost);
+  h.trim();
+  return h.length() > 0 && mqttPort > 0;
+}
+
+String escapeJsonString(const char* in) {
+  String out;
+  if (!in) return out;
+  for (size_t i = 0; in[i] != '\0'; i++) {
+    char c = in[i];
+    if (c == '"' || c == '\\') out += '\\';
+    if (c >= 0x20) out += c;
+  }
+  return out;
+}
+
+void preparaTopicsMqtt() {
+  if (mqttNodeId[0] != '\0') return;
+  uint64_t mac = ESP.getEfuseMac();
+  uint32_t tail = (uint32_t)((mac >> 24) & 0xFFFFFFULL) ^ (uint32_t)(mac & 0xFFFFFFULL);
+  snprintf(mqttNodeId, sizeof(mqttNodeId), "termostato_%06lx", (unsigned long)(tail & 0xFFFFFFUL));
+  snprintf(mqttTopicAvail, sizeof(mqttTopicAvail), "%s/status", mqttNodeId);
+  snprintf(mqttTopicState, sizeof(mqttTopicState), "%s/state", mqttNodeId);
+  snprintf(mqttTopicCmdMode, sizeof(mqttTopicCmdMode), "%s/cmd/mode", mqttNodeId);
+  snprintf(mqttTopicCmdTemp, sizeof(mqttTopicCmdTemp), "%s/cmd/target_temp", mqttNodeId);
+  snprintf(mqttTopicCmdAntigelo, sizeof(mqttTopicCmdAntigelo), "%s/cmd/antigelo", mqttNodeId);
+}
+
+void pubblicaDiscoveryHomeAssistant() {
+  if (!mqttConnesso) return;
+  preparaTopicsMqtt();
+
+  String devName = escapeJsonString(titleLabel);
+  if (devName.length() == 0) devName = "Termostato";
+
+  String devBlock = "\"dev\":{\"ids\":[\"";
+  devBlock += mqttNodeId;
+  devBlock += "\"],\"name\":\"";
+  devBlock += devName;
+  devBlock += "\",\"mdl\":\"GUITION ESP32-8048S050 5\\\"\",\"mf\":\"Custom ESP32-S3\",\"sw\":\"2.0\"}";
+
+  // 1. Entità principale Climate (Termostato Home Assistant)
+  {
+    String topic = "homeassistant/climate/";
+    topic += mqttNodeId;
+    topic += "/config";
+
+    String payload;
+    payload.reserve(680);
+    payload = "{\"name\":null,\"uniq_id\":\"";
+    payload += mqttNodeId;
+    payload += "_climate\",\"avty_t\":\"";
+    payload += mqttTopicAvail;
+    payload += "\",\"modes\":[\"off\",\"heat\"],\"mode_stat_t\":\"";
+    payload += mqttTopicState;
+    payload += "\",\"mode_stat_tpl\":\"{{ value_json.mode }}\",\"mode_cmd_t\":\"";
+    payload += mqttTopicCmdMode;
+    payload += "\",\"act_t\":\"";
+    payload += mqttTopicState;
+    payload += "\",\"act_tpl\":\"{{ value_json.action }}\",\"curr_temp_t\":\"";
+    payload += mqttTopicState;
+    payload += "\",\"curr_temp_tpl\":\"{{ value_json.temp }}\",\"temp_stat_t\":\"";
+    payload += mqttTopicState;
+    payload += "\",\"temp_stat_tpl\":\"{{ value_json.target }}\",\"temp_cmd_t\":\"";
+    payload += mqttTopicCmdTemp;
+    payload += "\",\"min_temp\":5.0,\"max_temp\":30.0,\"temp_step\":0.5,\"temp_unit\":\"C\",";
+    payload += devBlock;
+    payload += "}";
+
+    mqttClient.publish(topic.c_str(), 1, true, payload.c_str());
+  }
+
+  // 2. Sensore Temperatura
+  {
+    String topic = "homeassistant/sensor/";
+    topic += mqttNodeId;
+    topic += "_temp/config";
+    String payload = "{\"name\":\"Temperatura\",\"uniq_id\":\"";
+    payload += mqttNodeId;
+    payload += "_temp\",\"stat_t\":\"";
+    payload += mqttTopicState;
+    payload += "\",\"val_tpl\":\"{{ value_json.temp }}\",\"dev_cla\":\"temperature\",\"unit_of_meas\":\"°C\",\"stat_cla\":\"measurement\",\"avty_t\":\"";
+    payload += mqttTopicAvail;
+    payload += "\",";
+    payload += devBlock;
+    payload += "}";
+    mqttClient.publish(topic.c_str(), 1, true, payload.c_str());
+  }
+
+  // 3. Sensore Umidità
+  {
+    String topic = "homeassistant/sensor/";
+    topic += mqttNodeId;
+    topic += "_umid/config";
+    String payload = "{\"name\":\"Umidità\",\"uniq_id\":\"";
+    payload += mqttNodeId;
+    payload += "_umid\",\"stat_t\":\"";
+    payload += mqttTopicState;
+    payload += "\",\"val_tpl\":\"{{ value_json.umid }}\",\"dev_cla\":\"humidity\",\"unit_of_meas\":\"%\",\"stat_cla\":\"measurement\",\"avty_t\":\"";
+    payload += mqttTopicAvail;
+    payload += "\",";
+    payload += devBlock;
+    payload += "}";
+    mqttClient.publish(topic.c_str(), 1, true, payload.c_str());
+  }
+
+  // 4. Sensore Pressione
+  {
+    String topic = "homeassistant/sensor/";
+    topic += mqttNodeId;
+    topic += "_press/config";
+    String payload = "{\"name\":\"Pressione\",\"uniq_id\":\"";
+    payload += mqttNodeId;
+    payload += "_press\",\"stat_t\":\"";
+    payload += mqttTopicState;
+    payload += "\",\"val_tpl\":\"{{ value_json.press }}\",\"dev_cla\":\"atmospheric_pressure\",\"unit_of_meas\":\"hPa\",\"stat_cla\":\"measurement\",\"avty_t\":\"";
+    payload += mqttTopicAvail;
+    payload += "\",";
+    payload += devBlock;
+    payload += "}";
+    mqttClient.publish(topic.c_str(), 1, true, payload.c_str());
+  }
+
+  // 5. Numero regolabile Soglia Antigelo
+  {
+    String topic = "homeassistant/number/";
+    topic += mqttNodeId;
+    topic += "_antigelo/config";
+    String payload = "{\"name\":\"Soglia Antigelo\",\"uniq_id\":\"";
+    payload += mqttNodeId;
+    payload += "_antigelo\",\"stat_t\":\"";
+    payload += mqttTopicState;
+    payload += "\",\"val_tpl\":\"{{ value_json.antigelo }}\",\"cmd_t\":\"";
+    payload += mqttTopicCmdAntigelo;
+    payload += "\",\"min\":0.5,\"max\":10.0,\"step\":0.5,\"unit_of_meas\":\"°C\",\"icon\":\"mdi:snowflake-Alert\",\"avty_t\":\"";
+    payload += mqttTopicAvail;
+    payload += "\",";
+    payload += devBlock;
+    payload += "}";
+    mqttClient.publish(topic.c_str(), 1, true, payload.c_str());
+  }
+}
+
+void pubblicaStatoMqtt(bool force) {
+  if (!mqttConnesso) return;
+
+  static float lastT = -999.0f, lastH = -999.0f, lastP = -999.0f, lastTarget = -999.0f, lastAnti = -999.0f;
+  static bool lastOn = false, lastRisc = false;
+
+  bool changed = force || mqttStateDirty ||
+                 (fabsf(tempAttuale - lastT) >= 0.1f) ||
+                 (fabsf(umidAttuale - lastH) >= 1.0f) ||
+                 (fabsf(pressAttuale - lastP) >= 1.0f) ||
+                 (fabsf(tempTarget - lastTarget) >= 0.1f) ||
+                 (fabsf(tempAntigelo - lastAnti) >= 0.1f) ||
+                 (termostatoOn != lastOn) ||
+                 (riscaldamento != lastRisc);
+
+  if (!changed && (millis() - ultimoPublishMqttMs < 30000UL)) return;
+
+  mqttStateDirty = false;
+  ultimoPublishMqttMs = millis();
+  lastT = tempAttuale;
+  lastH = umidAttuale;
+  lastP = pressAttuale;
+  lastTarget = tempTarget;
+  lastAnti = tempAntigelo;
+  lastOn = termostatoOn;
+  lastRisc = riscaldamento;
+
+  const char* modeStr = termostatoOn ? "heat" : "off";
+  const char* actionStr = riscaldamento ? "heating" : (termostatoOn ? "idle" : "off");
+
+  char json[240];
+  snprintf(json, sizeof(json),
+           "{\"temp\":%.1f,\"umid\":%.0f,\"press\":%.0f,\"target\":%.1f,\"antigelo\":%.1f,\"mode\":\"%s\",\"action\":\"%s\",\"risc\":%s,\"on\":%s}",
+           tempAttuale, umidAttuale, pressAttuale, tempTarget, tempAntigelo,
+           modeStr, actionStr,
+           riscaldamento ? "true" : "false",
+           termostatoOn ? "true" : "false");
+
+  mqttClient.publish(mqttTopicState, 0, true, json);
+}
+
+void avviaConnessioneMqtt() {
+  if (!mqttConfigurato() || WiFi.status() != WL_CONNECTED || mqttConnesso) return;
+  preparaTopicsMqtt();
+
+  mqttClient.disconnect();
+  mqttClient.setServer(mqttHost, mqttPort);
+  if (strlen(mqttUser) > 0) {
+    mqttClient.setCredentials(mqttUser, mqttPass);
+  } else {
+    mqttClient.setCredentials(nullptr, nullptr);
+  }
+  mqttClient.setWill(mqttTopicAvail, 1, true, "offline");
+  mqttClient.connect();
+}
+
+void inizializzaMqttCallbacks() {
+  preparaTopicsMqtt();
+
+  mqttClient.onConnect([](bool sessionPresent) {
+    (void)sessionPresent;
+    mqttConnesso = true;
+    Serial.println("MQTT: connesso al broker Home Assistant.");
+    mqttClient.publish(mqttTopicAvail, 1, true, "online");
+    mqttClient.subscribe(mqttTopicCmdMode, 1);
+    mqttClient.subscribe(mqttTopicCmdTemp, 1);
+    mqttClient.subscribe(mqttTopicCmdAntigelo, 1);
+    mqttClient.subscribe("homeassistant/status", 1);
+    pubblicaDiscoveryHomeAssistant();
+    mqttStateDirty = true;
+  });
+
+  mqttClient.onDisconnect([](AsyncMqttClientDisconnectReason reason) {
+    (void)reason;
+    mqttConnesso = false;
+    Serial.println("MQTT: disconnesso.");
+  });
+
+  mqttClient.onMessage([](char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
+    (void)properties;
+    (void)index;
+    (void)total;
+    if (!topic || !payload || len == 0 || len > 64) return;
+
+    char msg[65];
+    memcpy(msg, payload, len);
+    msg[len] = '\0';
+    String val = String(msg);
+    val.trim();
+
+    if (strcmp(topic, mqttTopicCmdMode) == 0) {
+      if (val.equalsIgnoreCase("heat") || val.equalsIgnoreCase("on")) {
+        termostatoOn = true;
+        overrideManuale = true;
+        mqttStateDirty = true;
+        webSyncPending = true;
+      } else if (val.equalsIgnoreCase("off")) {
+        termostatoOn = false;
+        overrideManuale = true;
+        mqttStateDirty = true;
+        webSyncPending = true;
+      }
+    } else if (strcmp(topic, mqttTopicCmdTemp) == 0) {
+      float t = 0.0f;
+      if (stringToFloatStrict(val, t)) {
+        t = roundf(t * 2.0f) / 2.0f;
+        tempTarget = constrain(t, TARGET_MIN, TARGET_MAX);
+        mqttStateDirty = true;
+        webSyncPending = true;
+      }
+    } else if (strcmp(topic, mqttTopicCmdAntigelo) == 0) {
+      float a = 0.0f;
+      if (stringToFloatStrict(val, a)) {
+        a = roundf(a * 2.0f) / 2.0f;
+        tempAntigelo = constrain(a, ANTIGELO_MIN, ANTIGELO_MAX);
+        mqttStateDirty = true;
+        webSyncPending = true;
+        webMqttSavePending = true;
+      }
+    } else if (strcmp(topic, "homeassistant/status") == 0) {
+      if (val.equalsIgnoreCase("online")) {
+        pubblicaDiscoveryHomeAssistant();
+        mqttStateDirty = true;
+      }
+    }
+  });
+}
+
 void setup() {
   // Priorità assoluta al boot: mettere subito il relè caldaia in stato sicuro (OFF)
   inizializzaRele();
@@ -4434,7 +4743,11 @@ void setup() {
     aggiornaUI();
   }
 
-    
+  inizializzaMqttCallbacks();
+  if (WiFi.status() == WL_CONNECTED && mqttConfigurato()) {
+    avviaConnessioneMqtt();
+  }
+
     // Gestione Login / Logout Web
   server.on("/login", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (richiestaAutenticata(request)) {
@@ -4490,7 +4803,7 @@ void setup() {
     const char* bc = risc ? "#FF6B35" : "#4FC3F7";
 
     String html;
-    html.reserve(1800);
+    html.reserve(2600);
     html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Termostato</title>"
            "<style>"
            "body{background:#0D0D0D;color:#EAEAEA;font-family:system-ui,-apple-system,sans-serif;text-align:center;margin:0;padding:18px}"
@@ -4507,6 +4820,9 @@ void setup() {
            ".btn-on{background:#4FC3F7;color:#0D0D0D;width:100%}.btn-off{background:#FF6B35;color:#0D0D0D;width:100%}"
            ".on{color:#FF6B35;font-weight:700}.off{color:#8A94A6}"
            ".logout{background:transparent;border:1px solid #333B4D;color:#9BA3B0;font-size:12px;padding:7px 14px;border-radius:8px;cursor:pointer;margin-top:8px}"
+           "details{text-align:left;font-size:13px}"
+           "summary{cursor:pointer;color:#4FC3F7;font-weight:700;text-align:center;outline:none}"
+           ".in{width:100%;box-sizing:border-box;padding:8px 10px;margin:4px 0 10px;border-radius:8px;border:1px solid #2C3446;background:#0F1219;color:#FFF;font-size:13px}"
            "</style></head><body>";
     html += "<h1>";
     html += escapeHtml(String(titleLabel));
@@ -4535,11 +4851,63 @@ void setup() {
     html += String(pressAttuale, 0);
     html += " hPa</b></div><div style='margin-top:8px'>Riscaldamento: <span class='";
     html += (risc ? "on'>🔥 ATTIVO" : "off'>○ STANDBY");
-    html += "</span></div></div>"
+    html += "</span></div></div>";
+
+    html += "<div class='card'><details><summary>Home Assistant (MQTT): ";
+    if (!mqttConfigurato()) html += "<span style='color:#8A94A6'>Disattivato</span>";
+    else if (mqttConnesso) html += "<span style='color:#62D26F'>Connesso</span>";
+    else html += "<span style='color:#FFD166'>In connessione...</span>";
+    html += "</summary><form method='POST' action='/mqtt-config' style='margin-top:12px'>"
+            "<div class='lbl'>HOST / IP BROKER MQTT (vuoto = disattiva)</div>"
+            "<input class='in' type='text' name='host' placeholder='es. 192.168.1.100' value='";
+    html += escapeHtml(String(mqttHost));
+    html += "'><div class='lbl'>PORTA</div>"
+            "<input class='in' type='number' name='port' value='";
+    html += String(mqttPort);
+    html += "'><div class='lbl'>UTENTE MQTT (opzionale)</div>"
+            "<input class='in' type='text' name='user' value='";
+    html += escapeHtml(String(mqttUser));
+    html += "'><div class='lbl'>PASSWORD MQTT (lascia vuoto per non cambiare)</div>"
+            "<input class='in' type='password' name='pass' placeholder='••••••••'>"
+            "<button type='submit' class='btn btn-on' style='margin-top:4px'>Salva e Connetti MQTT</button>"
+            "</form></details></div>"
             "<form method='POST' action='/logout'><button type='submit' class='logout'>Esci (Logout)</button></form>"
             "</body></html>";
     
     request->send(200, "text/html", html);
+  });
+
+  server.on("/mqtt-config", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!richiediAuthWeb(request, true)) return;
+
+    if (request->hasParam("host", true)) {
+      String h = request->getParam("host", true)->value();
+      h.trim();
+      h.toCharArray(mqttHost, sizeof(mqttHost));
+    }
+    if (request->hasParam("port", true)) {
+      String pStr = request->getParam("port", true)->value();
+      int parsedPort = 1883;
+      if (stringToIntStrict(pStr, parsedPort) && parsedPort >= 1 && parsedPort <= 65535) {
+        mqttPort = (uint16_t)parsedPort;
+      }
+    }
+    if (request->hasParam("user", true)) {
+      String u = request->getParam("user", true)->value();
+      u.trim();
+      u.toCharArray(mqttUser, sizeof(mqttUser));
+    }
+    if (request->hasParam("pass", true)) {
+      String pw = request->getParam("pass", true)->value();
+      if (pw.length() > 0) {
+        pw.toCharArray(mqttPass, sizeof(mqttPass));
+      } else if (strlen(mqttHost) == 0) {
+        mqttPass[0] = '\0';
+      }
+    }
+
+    webMqttSavePending = true;
+    request->redirect("/");
   });
 
   // Gestione comandi (POST + Autenticazione + Thread-safe: delegano l'aggiornamento LVGL al loop principale su Core 1)
@@ -4777,6 +5145,19 @@ void loop() {
     }
   }
 
+  if (webMqttSavePending) {
+    webMqttSavePending = false;
+    saveConfig();
+    if (mqttConnesso) {
+      mqttClient.disconnect();
+      mqttConnesso = false;
+    }
+    if (mqttConfigurato() && WiFi.status() == WL_CONNECTED) {
+      ultimoTentativoMqttMs = millis();
+      avviaConnessioneMqtt();
+    }
+  }
+
   if (targetLogicPending && (millis() - ultimoCambioTargetMs >= TARGET_LOGIC_DEBOUNCE_MS)) {
     targetLogicPending = false;
     aggiornaTargetUIRapida();
@@ -4804,11 +5185,25 @@ void loop() {
         ntpConfigurato = true;
         controllaOraSistema(true);
       }
+
+      if (mqttConfigurato() && !mqttConnesso) {
+        ultimoTentativoMqttMs = millis();
+        avviaConnessioneMqtt();
+      }
     } else {
       assicuraAccessoWeb();
     }
 
     aggiornaWifiHeader();
+  }
+
+  if (statoWifi == WL_CONNECTED && mqttConfigurato()) {
+    if (!mqttConnesso && (millis() - ultimoTentativoMqttMs > 10000UL)) {
+      ultimoTentativoMqttMs = millis();
+      avviaConnessioneMqtt();
+    } else if (mqttConnesso) {
+      pubblicaStatoMqtt(false);
+    }
   }
 
   static unsigned long ultimoCheckAccessoWeb = 0;
