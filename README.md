@@ -38,14 +38,22 @@ Versione stabile, ottimizzata e messa in sicurezza:
   - Regolazione luminosità del display (dal 17% al 100%).
   - Regolazione soglia Antigelo e indicatore stato microSD.
 - **Web Server e Access Point di emergenza (Fallback AP):**
-  - Controllo completo da smartphone o PC (temperatura, target `+0.5°` / `-0.5°`, `ON`/`OFF`, stato JSON `/stato` e diagnostica `/sd`).
+  - Controllo completo da smartphone o PC (temperatura, target `+0.5°` / `-0.5°`, `ON`/`OFF`, configurazione MQTT, stato JSON `/stato` e diagnostica `/sd`).
+- **Home Assistant MQTT Auto-Discovery:**
+  - Rilevamento automatico in Home Assistant (senza configurazione YAML) con entità `climate` (termostato), `sensor` (temperatura, umidità, pressione) e `number` (soglia antigelo).
 
 ---
 
-## Hardware e Pinout
+## Hardware, Pinout e Librerie
 
-- **Board PlatformIO:** `esp32-s3-devkitc-1` (ESP32-S3, 16 MB Flash, PSRAM OPI)
+- **Board PlatformIO:** `esp32-s3-devkitc-1` (ESP32-S3, 16 MB Flash, PSRAM OPI a 80 MHz)
 - **Display:** GUITION / Sunton `ESP32-8048S050` 5" 800x480 RGB
+- **Librerie principali (`platformio.ini`):**
+  - `lovyan03/LovyanGFX`
+  - `lvgl/lvgl` (`^8.3.11`)
+  - `adafruit/Adafruit BME280 Library` & `Adafruit Unified Sensor`
+  - `ESPAsyncWebServer-esphome`
+  - `heman/AsyncMqttClient-esphome` (`^2.1.0`)
 - **MicroSD integrata (SPI dedicato):**
   - `CS = GPIO 10`, `MOSI = GPIO 11`, `SCK = GPIO 12`, `MISO = GPIO 13`
 - **Sensore BME280 (I2C) e Relè Caldaia:**
@@ -105,6 +113,15 @@ Appena connesso al broker, il termostato compare da solo in **Impostazioni → D
 - **Umidità (`sensor`):** umidità relativa in `%`.
 - **Pressione (`sensor`):** pressione atmosferica in `hPa`.
 - **Soglia Antigelo (`number`):** permette di leggere e modificare da Home Assistant la soglia antigelo (`0.5 °C` – `10.0 °C`) salvandola su microSD.
+
+### Topic MQTT utilizzati (`<node_id> = termostato_XXXXXX`)
+| Topic | Direzione | Descrizione |
+| :--- | :--- | :--- |
+| `<node_id>/status` | Termostato → Broker | Stato disponibilità (`online` / `offline` con Last Will) |
+| `<node_id>/state` | Termostato → Broker | Stato JSON completo (`temp`, `umid`, `press`, `target`, `antigelo`, `mode`, `action`, `risc`, `on`) |
+| `<node_id>/cmd/mode` | Broker → Termostato | Imposta modalità (`heat` / `off`) |
+| `<node_id>/cmd/target_temp` | Broker → Termostato | Imposta temperatura target (`5.0` – `30.0`, passo `0.5`) |
+| `<node_id>/cmd/antigelo` | Broker → Termostato | Imposta soglia antigelo (`0.5` – `10.0`, passo `0.5`) e salva su SD |
 
 > **Funzionamento autonomo (Fail-Safe):** anche se Home Assistant o il broker MQTT vengono spenti, il termostato continua a funzionare normalmente in locale seguendo il sensore BME280, le fasce orarie su microSD e la protezione antigelo.
 
