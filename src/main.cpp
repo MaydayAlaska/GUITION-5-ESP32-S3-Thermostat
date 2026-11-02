@@ -10,11 +10,20 @@
 #include <time.h> 
 #include <SD.h>
 #include <SPI.h>
+#include <esp_system.h>
 #include <esp32s3/rom/cache.h>
 
 char ssid[64]       = "SSID";
 char password[64]   = "PASSWORD";
 char titleLabel[64] = "TITLE";
+char webUser[32]    = "admin";
+char webPass[64]    = "termostato";
+char webSessionToken[33] = "";
+unsigned long webSessionLastSeenMs = 0;
+const unsigned long WEB_SESSION_TIMEOUT_MS = 3600000UL; // 1 ora
+unsigned long webLoginLastFailMs = 0;
+uint8_t webLoginFailCount = 0;
+const unsigned long WEB_LOGIN_LOCKOUT_MS = 5000UL; // 5 secondi anti brute-force
 
 // Configurazione Fuso Orario Italiano
 const char* NTPServer = "pool.ntp.org";
@@ -1355,11 +1364,12 @@ String mascheraPasswordInConfig(const String& raw) {
     if (!trimmed.startsWith("#") && eq > 0) {
       String key = trimmed.substring(0, eq);
       key.trim();
-      if (key == "pass") {
+      if (key == "pass" || key == "web_pass") {
         String val = trimmed.substring(eq + 1);
         val.trim();
-        out += "pass=";
-        out += passwordPlaceholder(val) ? "(non configurata)" : "********";
+        out += key;
+        out += "=";
+        out += (key == "pass" && passwordPlaceholder(val)) ? "(non configurata)" : "********";
         if (nl >= 0) out += '\n';
         start = (nl >= 0) ? (nl + 1) : len;
         continue;
@@ -1651,6 +1661,8 @@ bool saveConfig() {
   content += "title=" + String(titleLabel) + "\n";
   content += "ssid=" + String(ssid) + "\n";
   content += "pass=" + String(password) + "\n";
+  content += "web_user=" + String(webUser) + "\n";
+  content += "web_pass=" + String(webPass) + "\n";
   content += "antigelo=" + String(tempAntigelo, 1) + "\n";
   content += "brightness=" + String(displayBrightness) + "\n";
 
@@ -1720,6 +1732,14 @@ void loadConfig() {
     } else if (key == "pass") {
       value.toCharArray(password, sizeof(password));
       passPresente = true;
+    } else if (key == "web_user") {
+      if (value.length() > 0) {
+        value.toCharArray(webUser, sizeof(webUser));
+      }
+    } else if (key == "web_pass") {
+      if (value.length() > 0) {
+        value.toCharArray(webPass, sizeof(webPass));
+      }
     } else if (key == "antigelo") {
       float parsed = 0.0f;
 
@@ -4111,6 +4131,98 @@ void buildProgrammaUI() {
   }
 }
 
+// ── Autenticazione e Sicurezza Web (Step 2) ───────────────────
+void generaSessionToken() {
+  for (int i = 0; i < 4; i++) {
+    uint32_t r = esp_random();
+    snprintf(&webSessionToken[i * 8], 9, "%08lx", (unsigned long)r);
+  }
+  webSessionToken[32] = '\0';
+  webSessionLastSeenMs = millis();
+}
+
+bool costanteTimeEquals(const char* a, const char* b) {
+  if (!a || !b) return false;
+  size_t la = strlen(a);
+  size_t lb = strlen(b);
+  uint8_t diff = (la != lb) ? 1 : 0;
+  size_t m = (la < lb) ? la : lb;
+  for (size_t i = 0; i < m; i++) {
+    diff |= (uint8_t)(a[i] ^ b[i]);
+  }
+  return (diff == 0);
+}
+
+bool richiestaAutenticata(AsyncWebServerRequest* request) {
+  if (!request) return false;
+
+  // 1. Verifica Cookie di sessione (thermo_sess=<32 hex>)
+  if (webSessionToken[0] != '\0' && (millis() - webSessionLastSeenMs < WEB_SESSION_TIMEOUT_MS)) {
+    if (request->hasHeader("Cookie")) {
+      String cookie = request->getHeader("Cookie")->value();
+      int pos = cookie.indexOf("thermo_sess=");
+      if (pos >= 0) {
+        String val = cookie.substring(pos + 12);
+        int semi = val.indexOf(';');
+        if (semi >= 0) val = val.substring(0, semi);
+        val.trim();
+        if (val.length() == 32 && costanteTimeEquals(val.c_str(), webSessionToken)) {
+          webSessionLastSeenMs = millis();
+          return true;
+        }
+      }
+    }
+  }
+
+  // 2. Fallback: HTTP Basic Auth per script/API
+  if (request->authenticate(webUser, webPass)) {
+    return true;
+  }
+
+  return false;
+}
+
+bool richiediAuthWeb(AsyncWebServerRequest* request, bool isApiOrPost = false) {
+  if (richiestaAutenticata(request)) return true;
+
+  if (isApiOrPost) {
+    request->send(401, "text/plain", "Non autorizzato. Effettua il login su /login");
+  } else {
+    request->redirect("/login");
+  }
+  return false;
+}
+
+String buildLoginHtml(const char* errorMsg = nullptr) {
+  String html;
+  html.reserve(1400);
+  html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Login Termostato</title>"
+         "<style>"
+         "body{background:#0D0D0D;color:#EAEAEA;font-family:system-ui,-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:92vh;margin:0;padding:16px}"
+         ".box{background:#151821;border:1px solid #262C3A;border-radius:16px;padding:28px 24px;width:100%;max-width:340px;box-shadow:0 10px 30px rgba(0,0,0,0.5);text-align:center}"
+         "h1{font-size:20px;margin:0 0 6px;color:#4FC3F7;letter-spacing:0.5px}"
+         ".sub{font-size:13px;color:#8A94A6;margin-bottom:22px}"
+         "label{display:block;text-align:left;font-size:12px;color:#9BA3B0;margin:12px 0 6px;font-weight:600}"
+         "input{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:10px;border:1px solid #2C3446;background:#0F1219;color:#FFF;font-size:15px;outline:none}"
+         "input:focus{border-color:#4FC3F7}"
+         "button{width:100%;margin-top:20px;padding:12px;border:none;border-radius:10px;background:#4FC3F7;color:#0D0D0D;font-size:15px;font-weight:700;cursor:pointer}"
+         "button:active{opacity:0.85}"
+         ".err{background:#2E1518;border:1px solid #FF6B35;color:#FF8A65;padding:10px;border-radius:8px;font-size:13px;margin-bottom:14px}"
+         "</style></head><body><div class='box'><h1>";
+  html += titleLabel;
+  html += "</h1><div class='sub'>Accesso Pannello di Controllo</div>";
+  if (errorMsg && strlen(errorMsg) > 0) {
+    html += "<div class='err'>";
+    html += errorMsg;
+    html += "</div>";
+  }
+  html += "<form method='POST' action='/login'>"
+          "<label>UTENTE</label><input type='text' name='user' autocomplete='username' required autofocus>"
+          "<label>PASSWORD</label><input type='password' name='pass' autocomplete='current-password' required>"
+          "<button type='submit'>Accedi</button></form></div></body></html>";
+  return html;
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -4211,15 +4323,79 @@ void setup() {
   }
 
     
-    // Gestione pagina principale
+    // Gestione Login / Logout Web
+  server.on("/login", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (richiestaAutenticata(request)) {
+      request->redirect("/");
+      return;
+    }
+    request->send(200, "text/html", buildLoginHtml());
+  });
+
+  server.on("/login", HTTP_POST, [](AsyncWebServerRequest* request) {
+    unsigned long now = millis();
+    if (webLoginFailCount >= 5 && (now - webLoginLastFailMs < WEB_LOGIN_LOCKOUT_MS)) {
+      request->send(429, "text/html", buildLoginHtml("Troppi tentativi. Attendi 5 secondi."));
+      return;
+    }
+
+    String u = request->hasParam("user", true) ? request->getParam("user", true)->value() : "";
+    String p = request->hasParam("pass", true) ? request->getParam("pass", true)->value() : "";
+    u.trim();
+
+    if (costanteTimeEquals(u.c_str(), webUser) && costanteTimeEquals(p.c_str(), webPass)) {
+      webLoginFailCount = 0;
+      generaSessionToken();
+      AsyncWebServerResponse* response = request->beginResponse(303);
+      response->addHeader("Location", "/");
+      String cookieHeader = "thermo_sess=";
+      cookieHeader += webSessionToken;
+      cookieHeader += "; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600";
+      response->addHeader("Set-Cookie", cookieHeader);
+      request->send(response);
+      return;
+    }
+
+    webLoginFailCount++;
+    webLoginLastFailMs = now;
+    request->send(401, "text/html", buildLoginHtml("Utente o password non validi."));
+  });
+
+  server.on("/logout", HTTP_POST, [](AsyncWebServerRequest* request) {
+    webSessionToken[0] = '\0';
+    AsyncWebServerResponse* response = request->beginResponse(303);
+    response->addHeader("Location", "/login");
+    response->addHeader("Set-Cookie", "thermo_sess=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+    request->send(response);
+  });
+
+  // Gestione pagina principale
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!richiediAuthWeb(request, false)) return;
+
     bool risc = riscaldamento;
     bool tOn  = termostatoOn;
     const char* bc = risc ? "#FF6B35" : "#4FC3F7";
 
     String html;
-    html.reserve(1200);
-    html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Termostato</title><style>...</style></head><body>";
+    html.reserve(1800);
+    html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Termostato</title>"
+           "<style>"
+           "body{background:#0D0D0D;color:#EAEAEA;font-family:system-ui,-apple-system,sans-serif;text-align:center;margin:0;padding:18px}"
+           "h1{font-size:22px;margin:4px 0 14px;color:#FFF}"
+           ".circle{width:150px;height:150px;border-radius:50%;border:5px solid #4FC3F7;margin:0 auto 16px;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#141821}"
+           ".lbl{font-size:11px;color:#8A94A6;letter-spacing:1px;font-weight:700}"
+           ".temp{font-size:38px;font-weight:700;margin:2px 0}"
+           ".cyan{color:#4FC3F7}"
+           ".unit{font-size:14px;color:#8A94A6}"
+           ".card{background:#151821;border:1px solid #262C3A;border-radius:14px;padding:14px;max-width:340px;margin:0 auto 12px}"
+           ".row{display:flex;gap:10px;justify-content:center;margin:8px 0}"
+           ".btn{padding:10px 18px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;color:#FFF;background:#222836}"
+           ".btn-up{background:#FF6B35;color:#0D0D0D}.btn-down{background:#4FC3F7;color:#0D0D0D}"
+           ".btn-on{background:#4FC3F7;color:#0D0D0D;width:100%}.btn-off{background:#FF6B35;color:#0D0D0D;width:100%}"
+           ".on{color:#FF6B35;font-weight:700}.off{color:#8A94A6}"
+           ".logout{background:transparent;border:1px solid #333B4D;color:#9BA3B0;font-size:12px;padding:7px 14px;border-radius:8px;cursor:pointer;margin-top:8px}"
+           "</style></head><body>";
     html += "<h1>";
     html += titleLabel;
     html += "</h1><div class='circle' style='border-color:";
@@ -4232,10 +4408,10 @@ void setup() {
     html += String(tempTarget, 1);
     html += "°C</div><div style='font-size:13px;color:#aaa;margin-bottom:8px'>Antigelo: ";
     html += String(tempAntigelo, 1);
-    html += "°C</div><div class='row'><button class='btn btn-down' onclick='fetch(\"/giu\").then(()=>location.reload())'>- 0.5°</button><button class='btn btn-up' onclick='fetch(\"/su\").then(()=>location.reload())'>+ 0.5°</button></div></div><div class='card'><div class='row'>";
+    html += "°C</div><div class='row'><button class='btn btn-down' onclick='fetch(\"/giu\",{method:\"POST\"}).then(()=>location.reload())'>- 0.5°</button><button class='btn btn-up' onclick='fetch(\"/su\",{method:\"POST\"}).then(()=>location.reload())'>+ 0.5°</button></div></div><div class='card'><div class='row'>";
     
-    if (tOn) html += "<button class='btn btn-off' onclick='fetch(\"/off\").then(()=>location.reload())'>⏻ Spegni</button>";
-    else html += "<button class='btn btn-on' onclick='fetch(\"/on\").then(()=>location.reload())'>⏻ Accendi</button>";
+    if (tOn) html += "<button class='btn btn-off' onclick='fetch(\"/off\",{method:\"POST\"}).then(()=>location.reload())'>⏻ Spegni</button>";
+    else html += "<button class='btn btn-on' onclick='fetch(\"/on\",{method:\"POST\"}).then(()=>location.reload())'>⏻ Accendi</button>";
     
     html += "</div><div style='margin:6px 0'>Termostato: <b style='color:";
     html += (tOn ? "#4FC3F7" : "#FF6B35");
@@ -4247,13 +4423,16 @@ void setup() {
     html += String(pressAttuale, 0);
     html += " hPa</b></div><div style='margin-top:8px'>Riscaldamento: <span class='";
     html += (risc ? "on'>🔥 ATTIVO" : "off'>○ STANDBY");
-    html += "</span></div></div></body></html>";
+    html += "</span></div></div>"
+            "<form method='POST' action='/logout'><button type='submit' class='logout'>Esci (Logout)</button></form>"
+            "</body></html>";
     
     request->send(200, "text/html", html);
   });
 
-  // Gestione comandi (Thread-safe: delegano l'aggiornamento LVGL al loop principale su Core 1)
-  server.on("/su", HTTP_GET, [](AsyncWebServerRequest* request) { 
+  // Gestione comandi (POST + Autenticazione + Thread-safe: delegano l'aggiornamento LVGL al loop principale su Core 1)
+  server.on("/su", HTTP_POST, [](AsyncWebServerRequest* request) { 
+    if (!richiediAuthWeb(request, true)) return;
     if (tempTarget < TARGET_MAX) {
         tempTarget = constrain(tempTarget + 0.5f, TARGET_MIN, TARGET_MAX); 
         webSyncPending = true;
@@ -4261,7 +4440,8 @@ void setup() {
     request->send(200, "text/plain", "OK"); 
   });
 
-  server.on("/giu", HTTP_GET, [](AsyncWebServerRequest* request) { 
+  server.on("/giu", HTTP_POST, [](AsyncWebServerRequest* request) { 
+    if (!richiediAuthWeb(request, true)) return;
     if (tempTarget > TARGET_MIN) {
         tempTarget = constrain(tempTarget - 0.5f, TARGET_MIN, TARGET_MAX); 
         webSyncPending = true;
@@ -4269,14 +4449,16 @@ void setup() {
     request->send(200, "text/plain", "OK"); 
   });
 
-  server.on("/on", HTTP_GET, [](AsyncWebServerRequest* request) { 
+  server.on("/on", HTTP_POST, [](AsyncWebServerRequest* request) { 
+    if (!richiediAuthWeb(request, true)) return;
     termostatoOn = true; 
     overrideManuale = true; 
     webSyncPending = true;
     request->send(200, "text/plain", "OK"); 
   });
 
-  server.on("/off", HTTP_GET, [](AsyncWebServerRequest* request) { 
+  server.on("/off", HTTP_POST, [](AsyncWebServerRequest* request) { 
+    if (!richiediAuthWeb(request, true)) return;
     termostatoOn = false; 
     overrideManuale = true; 
     webSyncPending = true;
@@ -4284,6 +4466,7 @@ void setup() {
   });
 
   server.on("/stato", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!richiediAuthWeb(request, true)) return;
     char json[200];
     snprintf(json, sizeof(json),
              "{\"temp\":%.1f,\"umid\":%.0f,\"press\":%.0f,\"target\":%.1f,\"antigelo\":%.1f,\"risc\":%s,\"on\":%s,\"ora_valida\":%s}",
@@ -4296,14 +4479,15 @@ void setup() {
 
   
   server.on("/sd", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!richiediAuthWeb(request, false)) return;
     String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>SD Debug</title>";
-    html += "<style>body{background:#111;color:#ddd;font-family:monospace;padding:20px}pre{background:#222;padding:14px;border-radius:10px;white-space:pre-wrap}</style></head><body>";
+    html += "<style>body{background:#111;color:#ddd;font-family:monospace;padding:20px}pre{background:#222;padding:14px;border-radius:10px;white-space:pre-wrap}button{background:#4FC3F7;color:#111;border:none;padding:8px 14px;border-radius:6px;font-weight:bold;cursor:pointer}</style></head><body>";
     html += "<h1>Diagnostica SD</h1>";
     html += "<p>SD pronta: ";
     html += sdPronta ? "SI" : "NO";
     html += "</p><p>Ultimo messaggio: ";
     html += String(sdUltimoMessaggio);
-    html += "</p>";
+    html += "</p><form method='POST' action='/sd-init'><button type='submit'>Reinizializza SD</button></form>";
 
     html += "<h2>/config.txt</h2><pre>";
     html += SD.exists(CONFIG_PATH) ? mascheraPasswordInConfig(leggiFileComeStringa(CONFIG_PATH)) : "ASSENTE";
@@ -4318,7 +4502,8 @@ void setup() {
   });
 
 
-  server.on("/sd-init", HTTP_GET, [](AsyncWebServerRequest* request) {
+  server.on("/sd-init", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (!richiediAuthWeb(request, true)) return;
     sdPronta = false;
     bool ok = inizializzaSD();
 
