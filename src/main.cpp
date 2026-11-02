@@ -10,6 +10,7 @@
 #include <time.h> 
 #include <SD.h>
 #include <SPI.h>
+#include <esp32s3/rom/cache.h>
 
 char ssid[64]       = "SSID";
 char password[64]   = "PASSWORD";
@@ -82,7 +83,7 @@ bool  termostatoOn  = false;
 #define ANTIGELO_MIN 0.5f
 #define ANTIGELO_MAX 10.0f
 #define ISTERESI   1.0f
-#define ARC_GRADIENT_SEGMENTS 36
+#define ARC_GRADIENT_SEGMENTS 18
 
 // ── Colore dinamico slider temperatura ────────────────────────
 // Intervalli scelti:
@@ -171,7 +172,8 @@ const unsigned long TIMEOUT_DISPLAY = 30000;
 bool targetLogicPending = false;
 unsigned long ultimoCambioTargetMs = 0;
 const unsigned long TARGET_LOGIC_DEBOUNCE_MS = 140;
-const unsigned long TARGET_UI_MIN_INTERVAL_MS = 45;
+const unsigned long TARGET_UI_MIN_INTERVAL_MS = 32;
+volatile bool webSyncPending = false;
 
 AsyncWebServer server(80);
 bool webServerAvviato = false;
@@ -187,6 +189,11 @@ static lv_obj_t* arc_bg;
 static lv_obj_t* arc_current;
 static lv_obj_t* arc_target;
 static lv_obj_t* arc_target_gradient[ARC_GRADIENT_SEGMENTS];
+static int16_t arc_seg_cache_start[ARC_GRADIENT_SEGMENTS];
+static int16_t arc_seg_cache_end[ARC_GRADIENT_SEGMENTS];
+static uint8_t arc_seg_cache_opa[ARC_GRADIENT_SEGMENTS];
+static uint32_t arc_seg_cache_color[ARC_GRADIENT_SEGMENTS];
+static bool arc_seg_cache_init = false;
 static lv_obj_t* label_temp_grande;
 static lv_obj_t* label_temp_unit;
 static lv_obj_t* label_target_val;
@@ -213,10 +220,6 @@ bool programmaDirty = false;
 static lv_obj_t* label_datetime; 
 static lv_obj_t* btn_minus;
 static lv_obj_t* btn_plus;
-static lv_obj_t* btn_onoff;
-static lv_obj_t* btn_programma; 
-static lv_obj_t* label_programma_btn;
-static lv_obj_t* label_onoff;
 static lv_obj_t* label_target_title;
 static lv_obj_t* indicator_risc;
 static lv_obj_t* icon_antigelo_badge;
@@ -269,6 +272,7 @@ void applicaColoreSliderTarget() {
   static bool cacheValida = false;
   static float ultimoTargetDisegnato = -999.0f;
   static bool ultimoTermostatoDisegnato = false;
+  static uint32_t ultimoKnobHex = 0xFFFFFFFF;
 
   if (cacheValida &&
       fabsf(ultimoTargetDisegnato - tempTarget) < 0.01f &&
@@ -284,18 +288,15 @@ void applicaColoreSliderTarget() {
   progress = constrain(progress, 0.0f, 1.0f);
   int progressAngle = (int)(270.0f * progress);
 
-  // Il target arc non deve più coprire la sfumatura.
-  // Serve solo come oggetto interattivo e come knob.
-  lv_obj_set_style_arc_opa(arc_target, LV_OPA_TRANSP, LV_PART_INDICATOR);
-
-  uint32_t knobHex = coloreTemperaturaHex(tempTarget);
-  if (!termostatoOn) {
-    knobHex = 0x4A4A4A;
+  // Quantizziamo il colore del pallino a passi di 2°C per evitare che lv_obj_set_style_bg_color
+  // invalidi l'intero oggetto 360x360 ad ogni pressione di +/- (0.5°C).
+  float tempKnobQuant = roundf(tempTarget * 0.5f) * 2.0f;
+  uint32_t knobHex = termostatoOn ? coloreTemperaturaHex(tempKnobQuant) : 0x4A4A4A;
+  if (knobHex != ultimoKnobHex) {
+    ultimoKnobHex = knobHex;
+    lv_color_t knobColor = lv_color_hex(knobHex);
+    lv_obj_set_style_bg_color(arc_target, knobColor, LV_PART_KNOB);
   }
-
-  lv_color_t knobColor = lv_color_hex(knobHex);
-  lv_obj_set_style_bg_color(arc_target, knobColor, LV_PART_KNOB);
-  lv_obj_set_style_shadow_color(arc_target, knobColor, LV_PART_KNOB);
 
   for (int i = 0; i < ARC_GRADIENT_SEGMENTS; i++) {
     if (!arc_target_gradient[i]) continue;
@@ -303,53 +304,58 @@ void applicaColoreSliderTarget() {
     int startAngle = (270 * i) / ARC_GRADIENT_SEGMENTS;
     int endAngle   = (270 * (i + 1)) / ARC_GRADIENT_SEGMENTS;
 
-    // Segmenti oltre il pallino: invisibili.
-    // Resta visibile solo la guida grigia sottile sottostante.
-    if (startAngle >= progressAngle || progressAngle <= 0) {
-      lv_obj_set_style_arc_opa(arc_target_gradient[i], LV_OPA_TRANSP, LV_PART_INDICATOR);
-      continue;
-    }
-
-    int visibleEnd = endAngle;
-    if (visibleEnd > progressAngle) {
-      visibleEnd = progressAngle;
-    }
-
-    if (visibleEnd <= startAngle) {
-      lv_obj_set_style_arc_opa(arc_target_gradient[i], LV_OPA_TRANSP, LV_PART_INDICATOR);
-      continue;
+    int visibleEnd = startAngle;
+    if (progressAngle > startAngle) {
+      visibleEnd = (progressAngle < endAngle) ? progressAngle : endAngle;
     }
 
     float segmentRatio = (float)i / (float)(ARC_GRADIENT_SEGMENTS - 1);
     float tempSegmento = TARGET_MIN + segmentRatio * (TARGET_MAX - TARGET_MIN);
+    uint32_t cHex = termostatoOn ? coloreTemperaturaHex(tempSegmento) : 0x2F2F2F;
 
-    uint32_t cHex = coloreTemperaturaHex(tempSegmento);
-    if (!termostatoOn) {
-      cHex = 0x2F2F2F;
+    if (!arc_seg_cache_init || arc_seg_cache_color[i] != cHex) {
+      lv_obj_set_style_arc_color(arc_target_gradient[i], lv_color_hex(cHex), LV_PART_INDICATOR);
+      arc_seg_cache_color[i] = cHex;
     }
 
-    lv_arc_set_bg_angles(arc_target_gradient[i], startAngle, visibleEnd);
-    lv_obj_set_style_arc_color(arc_target_gradient[i], lv_color_hex(cHex), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_opa(arc_target_gradient[i], LV_OPA_COVER, LV_PART_INDICATOR);
+    // Usiamo lv_arc_set_bg_end_angle invece di cambiare LV_STYLE_ARC_OPA:
+    // lv_arc_set_bg_end_angle invalida solo il piccolo settore modificato (~25x25 px)
+    // invece dell'intero box 360x360 px! Quando visibleEnd == startAngle non disegna nulla.
+    if (!arc_seg_cache_init || arc_seg_cache_end[i] != visibleEnd) {
+      lv_arc_set_bg_end_angle(arc_target_gradient[i], visibleEnd);
+      arc_seg_cache_end[i] = (int16_t)visibleEnd;
+    }
   }
+
+  arc_seg_cache_init = true;
 }
 
 void creaArcoGradienteTarget() {
+  arc_seg_cache_init = false;
   for (int i = 0; i < ARC_GRADIENT_SEGMENTS; i++) {
     int startAngle = (270 * i) / ARC_GRADIENT_SEGMENTS;
-    int endAngle   = (270 * (i + 1)) / ARC_GRADIENT_SEGMENTS;
+
+    float segmentRatio = (float)i / (float)(ARC_GRADIENT_SEGMENTS - 1);
+    float tempSegmento = TARGET_MIN + segmentRatio * (TARGET_MAX - TARGET_MIN);
+    uint32_t cHex = termostatoOn ? coloreTemperaturaHex(tempSegmento) : 0x2F2F2F;
+
+    arc_seg_cache_start[i] = (int16_t)startAngle;
+    arc_seg_cache_end[i]   = (int16_t)startAngle;
+    arc_seg_cache_opa[i]   = LV_OPA_COVER;
+    arc_seg_cache_color[i] = cHex;
 
     arc_target_gradient[i] = lv_arc_create(scr_main);
     lv_obj_set_size(arc_target_gradient[i], 360, 360);
     lv_obj_set_pos(arc_target_gradient[i], 220, 55);
     lv_arc_set_rotation(arc_target_gradient[i], 135);
-    lv_arc_set_bg_angles(arc_target_gradient[i], startAngle, endAngle);
+    lv_arc_set_bg_angles(arc_target_gradient[i], startAngle, startAngle);
     lv_arc_set_range(arc_target_gradient[i], 0, 100);
     lv_arc_set_value(arc_target_gradient[i], 100);
 
     lv_obj_set_style_arc_opa(arc_target_gradient[i], LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_arc_width(arc_target_gradient[i], 24, LV_PART_MAIN);
-    lv_obj_set_style_arc_opa(arc_target_gradient[i], LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc_target_gradient[i], lv_color_hex(cHex), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_opa(arc_target_gradient[i], LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_arc_width(arc_target_gradient[i], 24, LV_PART_INDICATOR);
 
     lv_obj_remove_style(arc_target_gradient[i], NULL, LV_PART_KNOB);
@@ -451,17 +457,6 @@ unsigned long ultimoCheckOra = 0;
 const unsigned long CHECK_ORA_INTERVAL_MS = 30000UL;
 const int ANNO_MIN_VALIDO = 2024;
 
-// ── Timer hardware per LVGL tick (Core v2.x) ──────────────────
-hw_timer_t* lvgl_timer = NULL;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
-volatile uint32_t lvgl_tick_ms = 0;
-
-void IRAM_ATTR onTimer() {
-  portENTER_CRITICAL_ISR(&timerMux);
-  lvgl_tick_ms++;
-  portEXIT_CRITICAL_ISR(&timerMux);
-}
-
 
 // ── Gestione sicura relè e BME280 ─────────────────────────────
 void setReleHardware(bool acceso) {
@@ -506,6 +501,14 @@ void inizializzaBME280() {
     return;
   }
 
+  // Configurazione per termostato: Forced Mode (misura su richiesta),
+  // oversampling 1x e filtro IIR per letture stabili e minimo auto-riscaldamento.
+  bme.setSampling(Adafruit_BME280::MODE_FORCED,
+                  Adafruit_BME280::SAMPLING_X1, // temperatura
+                  Adafruit_BME280::SAMPLING_X1, // pressione
+                  Adafruit_BME280::SAMPLING_X1, // umidità
+                  Adafruit_BME280::FILTER_X4);
+
   Serial.println("BME280 rilevato correttamente.");
 #else
   bmePresente = false;
@@ -521,6 +524,7 @@ void leggiSensoreBME280() {
     return;
   }
 
+  bme.takeForcedMeasurement();
   float t_letta = bme.readTemperature();
   float h_letta = bme.readHumidity();
   float p_letta = bme.readPressure() / 100.0F;
@@ -567,13 +571,42 @@ bool antigeloStaComandando() {
 }
 
 // ── Flush display ─────────────────────────────────────────────
-void my_disp_flush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
-  uint32_t w = area->x2 - area->x1 + 1;
-  uint32_t h = area->y2 - area->y1 + 1;
-  lcd.startWrite();
-  lcd.setAddrWindow(area->x1, area->y1, w, h);
-  lcd.writePixels((lgfx::rgb565_t*)color_p, w * h);
-  lcd.endWrite();
+// Su ESP32-S3 la FIFO GDMA dell'LCD_CAM è profonda solo 64 byte (32 pixel = 2.0 µs a 16 MHz).
+// Qualsiasi chiamata a Cache_WriteBack_Addr su blocchi grandi (anche una sola riga da 1600 byte = ~12 µs)
+// blocca il bus PSRAM più a lungo di 2.0 µs, svuotando la FIFO e causando il tremolio orizzontale.
+// Copiando e facendo il writeback di max 32 pixel (64 byte = ~0.4 µs) alla volta da IRAM,
+// con una micro-pausa di ~0.5 µs in IRAM tra un blocco e l'altro, il GDMA ricarica sempre la FIFO.
+IRAM_ATTR void my_disp_flush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color_p) {
+  uint16_t* fb = (uint16_t*)lcd._bus_instance.getDMABuffer(0);
+  if (!fb) {
+    lv_disp_flush_ready(disp);
+    return;
+  }
+
+  const uint32_t x1 = area->x1;
+  const uint32_t y1 = area->y1;
+  const uint32_t w  = area->x2 - x1 + 1;
+  const uint32_t h  = area->y2 - y1 + 1;
+  const uint16_t* src = (const uint16_t*)color_p;
+  const uint32_t step_px = 32; // 32 pixel = 64 byte (1 cache line)
+
+  for (uint32_t row = 0; row < h; row++) {
+    uint16_t* dst_row = fb + (y1 + row) * 800 + x1;
+    const uint16_t* src_row = src + row * w;
+    uint32_t col = 0;
+    while (col < w) {
+      uint32_t cnt = (w - col < step_px) ? (w - col) : step_px;
+      uint32_t bytes = cnt << 1;
+      uint16_t* dst = dst_row + col;
+      memcpy(dst, src_row + col, bytes);
+      Cache_WriteBack_Addr((uint32_t)dst, bytes);
+      for (volatile int d = 0; d < 28; d++) {
+        __asm__ __volatile__("nop");
+      }
+      col += cnt;
+    }
+  }
+
   lv_disp_flush_ready(disp);
 }
 
@@ -581,6 +614,19 @@ void my_disp_flush(lv_disp_drv_t* disp, const lv_area_t* area, lv_color_t* color
 void my_touch_read(lv_indev_drv_t* indev, lv_indev_data_t* data) {
   lgfx::touch_point_t tp;
   static bool attesaRilascioRisveglio = false;
+  static unsigned long ultimoPollStandbyMs = 0;
+
+  // Quando lo schermo è spento, riduciamo le letture I2C del touch a ~120ms
+  // per risparmiare bus I2C e CPU mantenendo immediato il risveglio al tocco.
+  if (!displayAcceso) {
+    unsigned long now = millis();
+    if (now - ultimoPollStandbyMs < 120) {
+      data->state = LV_INDEV_STATE_REL;
+      return;
+    }
+    ultimoPollStandbyMs = now;
+  }
+
   bool toccato = lcd.getTouch(&tp);
 
   if (toccato) {
@@ -797,19 +843,24 @@ void aggiornaWifiHeader() {
   if (!btn_wifi || !label_wifi || !label_wifi_sub || !wifi_indicator_dot) return;
 
   wl_status_t st = WiFi.status();
-  String ipCorrente = (st == WL_CONNECTED) ? WiFi.localIP().toString() : "";
+  uint32_t ipRaw = (st == WL_CONNECTED) ? (uint32_t)WiFi.localIP() : 0;
 
   static int ultimoStatoHeader = -999;
-  static String ultimoIpHeader = "";
+  static uint32_t ultimoIpRawHeader = 0xFFFFFFFF;
+  static bool ultimoApHeader = false;
 
-  if (ultimoStatoHeader == (int)st && ultimoIpHeader == ipCorrente) {
+  if (ultimoStatoHeader == (int)st &&
+      ultimoIpRawHeader == ipRaw &&
+      ultimoApHeader == apFallbackAttivo) {
     return;
   }
 
   ultimoStatoHeader = (int)st;
-  ultimoIpHeader = ipCorrente;
+  ultimoIpRawHeader = ipRaw;
+  ultimoApHeader = apFallbackAttivo;
 
   if (st == WL_CONNECTED) {
+    String ipCorrente = WiFi.localIP().toString();
     lv_obj_set_style_bg_color(btn_wifi, lv_color_hex(0x061F2C), 0);
     lv_obj_set_style_border_color(btn_wifi, lv_color_hex(0x4FC3F7), 0);
     lv_obj_set_style_shadow_width(btn_wifi, 8, 0);
@@ -817,10 +868,10 @@ void aggiornaWifiHeader() {
     lv_obj_set_style_shadow_opa(btn_wifi, LV_OPA_20, 0);
 
     lv_obj_set_style_bg_color(wifi_indicator_dot, lv_color_hex(0x62D26F), 0);
-    lv_label_set_text(label_wifi, "WIFI");
+    setLabelTextIfChanged(label_wifi, "WIFI");
     lv_obj_set_style_text_color(label_wifi, lv_color_hex(0xBFEFFF), 0);
 
-    lv_label_set_text(label_wifi_sub, ipCorrente.c_str());
+    setLabelTextIfChanged(label_wifi_sub, ipCorrente.c_str());
     lv_obj_set_style_text_color(label_wifi_sub, lv_color_hex(0x6ED6FF), 0);
   } else if (st == WL_IDLE_STATUS || st == WL_DISCONNECTED) {
     if (apFallbackAttivo) {
@@ -831,9 +882,9 @@ void aggiornaWifiHeader() {
       lv_obj_set_style_shadow_opa(btn_wifi, LV_OPA_20, 0);
 
       lv_obj_set_style_bg_color(wifi_indicator_dot, lv_color_hex(0xFFD166), 0);
-      lv_label_set_text(label_wifi, "WIFI AP");
+      setLabelTextIfChanged(label_wifi, "WIFI AP");
       lv_obj_set_style_text_color(label_wifi, lv_color_hex(0xBFEFFF), 0);
-      lv_label_set_text(label_wifi_sub, "192.168.4.1");
+      setLabelTextIfChanged(label_wifi_sub, "192.168.4.1");
       lv_obj_set_style_text_color(label_wifi_sub, lv_color_hex(0x6ED6FF), 0);
     } else {
       lv_obj_set_style_bg_color(btn_wifi, lv_color_hex(0x151515), 0);
@@ -841,9 +892,9 @@ void aggiornaWifiHeader() {
       lv_obj_set_style_shadow_width(btn_wifi, 0, 0);
 
       lv_obj_set_style_bg_color(wifi_indicator_dot, lv_color_hex(0xFF6B35), 0);
-      lv_label_set_text(label_wifi, "WIFI OFF");
+      setLabelTextIfChanged(label_wifi, "WIFI OFF");
       lv_obj_set_style_text_color(label_wifi, lv_color_hex(0xA0A0A0), 0);
-      lv_label_set_text(label_wifi_sub, "tocca per rete");
+      setLabelTextIfChanged(label_wifi_sub, "tocca per rete");
       lv_obj_set_style_text_color(label_wifi_sub, lv_color_hex(0x777777), 0);
     }
   } else {
@@ -854,36 +905,20 @@ void aggiornaWifiHeader() {
     lv_obj_set_style_shadow_opa(btn_wifi, LV_OPA_20, 0);
 
     lv_obj_set_style_bg_color(wifi_indicator_dot, lv_color_hex(0xFFD166), 0);
-    lv_label_set_text(label_wifi, "WIFI...");
+    setLabelTextIfChanged(label_wifi, "WIFI...");
     lv_obj_set_style_text_color(label_wifi, lv_color_hex(0xFFD166), 0);
-    lv_label_set_text(label_wifi_sub, "connessione");
+    setLabelTextIfChanged(label_wifi_sub, "connessione");
     lv_obj_set_style_text_color(label_wifi_sub, lv_color_hex(0xD7B85A), 0);
   }
 }
 
 void aggiornaStatoGraficoOra() {
-  if (btn_programma != NULL) {
-    if (oraSistemaValida) {
-      lv_obj_set_style_bg_color(btn_programma, lv_color_hex(0x1A1A1A), 0);
-      lv_obj_set_style_border_color(btn_programma, lv_color_hex(0x4FC3F7), 0);
-    } else {
-      lv_obj_set_style_bg_color(btn_programma, lv_color_hex(0x202020), 0);
-      lv_obj_set_style_border_color(btn_programma, lv_color_hex(0x555555), 0);
-    }
-  }
-
-  if (label_programma_btn != NULL) {
-    lv_label_set_text(label_programma_btn, oraSistemaValida ? "ORARI" : "ORARI (!)");
-    lv_obj_set_style_text_color(label_programma_btn,
-      oraSistemaValida ? lv_color_hex(0x4FC3F7) : lv_color_hex(0x777777), 0);
-  }
-
   if (label_orario_status != NULL && !programmaDirty) {
     if (oraSistemaValida) {
-      lv_label_set_text(label_orario_status, "ORA SINCRONIZZATA - FASCE ATTIVE");
+      setLabelTextIfChanged(label_orario_status, "ORA SINCRONIZZATA - FASCE ATTIVE");
       lv_obj_set_style_text_color(label_orario_status, lv_color_hex(0x4FC3F7), 0);
     } else {
-      lv_label_set_text(label_orario_status, "ORA NON DISPONIBILE - FASCE SOSPESE");
+      setLabelTextIfChanged(label_orario_status, "ORA NON DISPONIBILE - FASCE SOSPESE");
       lv_obj_set_style_text_color(label_orario_status, lv_color_hex(0x777777), 0);
     }
   }
@@ -961,46 +996,42 @@ void aggiornaUI() {
     lv_arc_set_value(arc_target, v_tgt);
   }
 
-  if (antigeloStaComandando()) {
-    lv_label_set_text(label_stato_centro, "ANTIGELO ATTIVO");
-    lv_obj_set_style_text_color(label_stato_centro, lv_color_hex(0x4FC3F7), 0);
+  int statoCentroMode = 0; // 0 spento, 1 attesa, 2 riscaldamento, 3 antigelo
+  if (antigeloStaComandando()) statoCentroMode = 3;
+  else if (!termostatoOn) statoCentroMode = 0;
+  else if (riscaldamento) statoCentroMode = 2;
+  else statoCentroMode = 1;
 
-    lv_obj_set_style_bg_color(btn_onoff, lv_color_hex(0x2a2a2a), 0);
-    lv_obj_set_style_border_color(btn_onoff, lv_color_hex(0x555555), 0);
-    lv_label_set_text(label_onoff, "OFF");
-    lv_obj_set_style_text_color(label_onoff, lv_color_hex(0x888888), 0);
-    applicaColoreSliderTarget();
-    lv_obj_set_style_opa(indicator_risc, LV_OPA_COVER, 0);
-  } else if (!termostatoOn) {
-    lv_label_set_text(label_stato_centro, "TERMOSTATO OFF");
-    lv_obj_set_style_text_color(label_stato_centro, lv_color_hex(0x555555), 0);
+  static int ultimoStatoCentroMode = -1;
+  if (statoCentroMode != ultimoStatoCentroMode) {
+    ultimoStatoCentroMode = statoCentroMode;
+    if (statoCentroMode == 3) {
+      setLabelTextIfChanged(label_stato_centro, "ANTIGELO ATTIVO");
+      lv_obj_set_style_text_color(label_stato_centro, lv_color_hex(0x4FC3F7), 0);
+      lv_obj_set_style_opa(indicator_risc, LV_OPA_COVER, 0);
+    } else if (statoCentroMode == 0) {
+      setLabelTextIfChanged(label_stato_centro, "TERMOSTATO OFF");
+      lv_obj_set_style_text_color(label_stato_centro, lv_color_hex(0x555555), 0);
+      lv_obj_set_style_opa(indicator_risc, LV_OPA_TRANSP, 0);
+    } else if (statoCentroMode == 2) {
+      setLabelTextIfChanged(label_stato_centro, "RISCALDAMENTO");
+      lv_obj_set_style_text_color(label_stato_centro, lv_color_hex(0xFF6B35), 0);
+      lv_obj_set_style_opa(indicator_risc, LV_OPA_COVER, 0);
+    } else {
+      setLabelTextIfChanged(label_stato_centro, "IN ATTESA");
+      lv_obj_set_style_text_color(label_stato_centro, lv_color_hex(0x4FC3F7), 0);
+      lv_obj_set_style_opa(indicator_risc, LV_OPA_TRANSP, 0);
+    }
+  }
 
-    lv_obj_set_style_bg_color(btn_onoff, lv_color_hex(0x2a2a2a), 0);
-    lv_obj_set_style_border_color(btn_onoff, lv_color_hex(0x555555), 0);
-    lv_label_set_text(label_onoff, "OFF");
-    lv_obj_set_style_text_color(label_onoff, lv_color_hex(0x888888), 0);
-    applicaColoreSliderTarget();
-    lv_obj_set_style_opa(indicator_risc, LV_OPA_TRANSP, 0);
-  } else if (riscaldamento) {
-    lv_label_set_text(label_stato_centro, "RISCALDAMENTO");
-    lv_obj_set_style_text_color(label_stato_centro, lv_color_hex(0xFF6B35), 0);
+  applicaColoreSliderTarget();
 
-    lv_obj_set_style_bg_color(btn_onoff, lv_color_hex(0x3a1a00), 0);
-    lv_obj_set_style_border_color(btn_onoff, lv_color_hex(0xFF6B35), 0);
-    lv_label_set_text(label_onoff, "ON");
-    lv_obj_set_style_text_color(label_onoff, lv_color_hex(0xFF6B35), 0);
-    applicaColoreSliderTarget();
-    lv_obj_set_style_opa(indicator_risc, LV_OPA_COVER, 0);
-  } else {
-    lv_label_set_text(label_stato_centro, "IN ATTESA");
-    lv_obj_set_style_text_color(label_stato_centro, lv_color_hex(0x4FC3F7), 0);
-
-    lv_obj_set_style_bg_color(btn_onoff, lv_color_hex(0x002a3a), 0);
-    lv_obj_set_style_border_color(btn_onoff, lv_color_hex(0x4FC3F7), 0);
-    lv_label_set_text(label_onoff, "ON");
-    lv_obj_set_style_text_color(label_onoff, lv_color_hex(0x4FC3F7), 0);
-    applicaColoreSliderTarget();
-    lv_obj_set_style_opa(indicator_risc, LV_OPA_TRANSP, 0);
+  if (icon_antigelo_badge) {
+    if (antigeloStaComandando()) {
+      lv_obj_clear_flag(icon_antigelo_badge, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(icon_antigelo_badge, LV_OBJ_FLAG_HIDDEN);
+    }
   }
 
   aggiornaBadgeStato();
@@ -1197,7 +1228,6 @@ static void btn_plus_cb(lv_event_t* e) {
     tempTarget = constrain(tempTarget + 0.5f, TARGET_MIN, TARGET_MAX);
     aggiornaTargetUIRapida();
     aggiornaLogica();
-    aggiornaUI();
   }
 }
 
@@ -1206,7 +1236,6 @@ static void btn_minus_cb(lv_event_t* e) {
     tempTarget = constrain(tempTarget - 0.5f, TARGET_MIN, TARGET_MAX);
     aggiornaTargetUIRapida();
     aggiornaLogica();
-    aggiornaUI();
   }
 }
 
@@ -1310,6 +1339,43 @@ void setSdStatus(const char* msg) {
   Serial.println(sdUltimoMessaggio);
 }
 
+String mascheraPasswordInConfig(const String& raw) {
+  String out;
+  out.reserve(raw.length() + 16);
+
+  int start = 0;
+  int len = raw.length();
+  while (start < len) {
+    int nl = raw.indexOf('\n', start);
+    String line = (nl >= 0) ? raw.substring(start, nl) : raw.substring(start);
+    String trimmed = line;
+    trimmed.trim();
+
+    int eq = trimmed.indexOf('=');
+    if (!trimmed.startsWith("#") && eq > 0) {
+      String key = trimmed.substring(0, eq);
+      key.trim();
+      if (key == "pass") {
+        String val = trimmed.substring(eq + 1);
+        val.trim();
+        out += "pass=";
+        out += passwordPlaceholder(val) ? "(non configurata)" : "********";
+        if (nl >= 0) out += '\n';
+        start = (nl >= 0) ? (nl + 1) : len;
+        continue;
+      }
+    }
+
+    out += line;
+    if (nl >= 0) out += '\n';
+    start = (nl >= 0) ? (nl + 1) : len;
+  }
+
+  return out;
+}
+
+String leggiFileComeStringa(const char* path);
+
 void stampaFileSD(const char* path) {
   if (!sdPronta) {
     Serial.print("DEBUG SD: SD non pronta, impossibile leggere ");
@@ -1325,23 +1391,17 @@ void stampaFileSD(const char* path) {
     return;
   }
 
-  File file = SD.open(path, FILE_READ);
-  if (!file) {
-    Serial.println("DEBUG SD: file esiste ma non si apre.");
-    return;
-  }
-
+  String content = leggiFileComeStringa(path);
   Serial.print("DEBUG SD: size=");
-  Serial.println(file.size());
+  Serial.println(content.length());
   Serial.println("----- INIZIO FILE -----");
-
-  while (file.available()) {
-    Serial.write(file.read());
+  if (strcmp(path, CONFIG_PATH) == 0) {
+    Serial.print(mascheraPasswordInConfig(content));
+  } else {
+    Serial.print(content);
   }
-
   Serial.println();
   Serial.println("------ FINE FILE ------");
-  file.close();
 }
 
 bool inizializzaSD() {
@@ -1374,8 +1434,6 @@ bool inizializzaSD() {
     if (SD.begin(SD_CS_PIN, SPI, 4000000)) {
       sdPronta = true;
       setSdStatus("SD pronta.");
-      stampaFileSD(CONFIG_PATH);
-      stampaFileSD(FASCE_PATH);
       return true;
     }
 
@@ -1391,8 +1449,6 @@ bool inizializzaSD() {
   if (SD.begin(SD_CS_PIN, SPI, 1000000)) {
     sdPronta = true;
     setSdStatus("SD pronta a 1MHz.");
-    stampaFileSD(CONFIG_PATH);
-    stampaFileSD(FASCE_PATH);
     return true;
   }
 
@@ -1415,8 +1471,19 @@ String leggiFileComeStringa(const char* path) {
   File file = SD.open(path, FILE_READ);
   if (!file) return content;
 
-  while (file.available()) {
-    content += (char)file.read();
+  size_t sz = file.size();
+  if (sz > 0 && sz <= 4096) {
+    content.reserve(sz + 1);
+    while (file.available()) {
+      char buf[128];
+      size_t n = file.readBytes(buf, sizeof(buf) - 1);
+      buf[n] = '\0';
+      content += buf;
+    }
+  } else {
+    while (file.available()) {
+      content += (char)file.read();
+    }
   }
 
   file.close();
@@ -1435,7 +1502,13 @@ bool scriviStringaSuFileSicuro(const char* path, const String& content) {
   bool avevaVecchioFile = SD.exists(path);
   String vecchioContenuto = avevaVecchioFile ? leggiFileComeStringa(path) : "";
 
-  if (SD.exists(path)) {
+  if (avevaVecchioFile && vecchioContenuto == content) {
+    Serial.print("SD OK: file invariato, skip scrittura: ");
+    Serial.println(path);
+    return true;
+  }
+
+  if (avevaVecchioFile) {
     if (!SD.remove(path)) {
       Serial.print("ERRORE SD: impossibile rimuovere il vecchio file ");
       Serial.println(path);
@@ -1469,20 +1542,8 @@ bool scriviStringaSuFileSicuro(const char* path, const String& content) {
     return false;
   }
 
-  String verifica = leggiFileComeStringa(path);
-  if (verifica != content) {
-    Serial.print("ERRORE SD: verifica fallita dopo salvataggio ");
-    Serial.println(path);
-    Serial.print("Atteso byte: ");
-    Serial.print(content.length());
-    Serial.print(" letto byte: ");
-    Serial.println(verifica.length());
-    return false;
-  }
-
-  Serial.print("SD OK: file salvato e verificato: ");
+  Serial.print("SD OK: file salvato: ");
   Serial.println(path);
-  stampaFileSD(path);
   return true;
 }
 
@@ -1700,7 +1761,6 @@ void loadConfig() {
   Serial.print(titleLabel);
   Serial.print(" ssid=");
   Serial.println(ssid);
-  stampaFileSD(CONFIG_PATH);
 
   if (riscriviConfig) {
     Serial.println("SD: config incompleta o vecchio formato, riscrivo /config.txt.");
@@ -1823,7 +1883,6 @@ bool loadFasceTxt() {
 
   Serial.print("SD OK: fasce caricate da /fasce.txt. Numero fasce: ");
   Serial.println(idx);
-  stampaFileSD(FASCE_PATH);
 
   if (formatoDaRipulire) {
     Serial.println("SD: /fasce.txt contiene righe non valide, riscrivo pulito.");
@@ -1955,6 +2014,8 @@ static void btn_wifi_toggle_password_cb(lv_event_t* e) {
   aggiornaPasswordDisplay();
 }
 
+static bool wifi_kb_built = false;
+
 void chiudiWifiMenu() {
   if (wifi_modal != NULL) {
     lv_obj_del(wifi_modal);
@@ -1971,6 +2032,7 @@ void chiudiWifiMenu() {
     wifi_keyboard_container = NULL;
     wifi_modal_status_label = NULL;
     wifi_keyboard_mode_label = NULL;
+    wifi_kb_built = false;
     wifiPasswordBuffer[0] = '\0';
     wifiPasswordVisibile = false;
     wifiScanCount = 0;
@@ -2010,22 +2072,14 @@ void preparaRadioWifiPerScansione(bool giaConnesso) {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.scanDelete();
-    delay(120);
     return;
   }
 
   // Se non siamo connessi, fermiamo eventuali vecchi tentativi di connessione.
-  // Non usiamo erase=true: con una rete vecchia nel config può rendere instabile
-  // la radio mentre l'utente sta scorrendo la lista LVGL.
   WiFi.disconnect(false, false);
-  delay(250);
-
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(apFallbackAttivo ? WIFI_AP_STA : WIFI_STA);
   WiFi.setSleep(false);
-  delay(450);
-
   WiFi.scanDelete();
-  delay(150);
 }
 
 void mostraListaWifiInizialeRapida() {
@@ -2075,15 +2129,14 @@ void mostraListaWifiInizialeRapida() {
   lv_label_set_text(wifi_modal_status_label, msg);
 }
 
-void aggiornaListaWifi() {
-  if (!wifi_modal_status_label || !wifi_network_roller) return;
+static bool wifiAsyncScanAttiva = false;
 
-  bool scansioneProfonda = wifiScanProfondaRichiesta;
-  wifiScanProfondaRichiesta = false;
-
-  lv_label_set_text(wifi_modal_status_label,
-                    scansioneProfonda ? "Scansione completa reti WiFi..." : "Scansione rapida reti WiFi...");
-  lv_timer_handler();
+void finalizzaRisultatiScansioneWifi(int n) {
+  wifiAsyncScanAttiva = false;
+  if (!wifi_modal || !wifi_modal_status_label || !wifi_network_roller) {
+    WiFi.scanDelete();
+    return;
+  }
 
   wifiScanCount = 0;
   wifiRollerOptions[0] = '\0';
@@ -2104,35 +2157,8 @@ void aggiornaListaWifi() {
   String reteSalvata = String(ssid);
   reteSalvata.trim();
 
-  // Teniamo la rete connessa come scelta valida, ma non aggiungiamo reti salvate
-  // non rilevate, così evitiamo opzioni fittizie nella roller.
   if (reteCorrente.length() > 0) {
     aggiungiOpzioneWifi(reteCorrente, "CONNESSA: " + reteCorrente, true);
-  }
-
-  preparaRadioWifiPerScansione(giaConnesso);
-
-  lv_timer_handler();
-
-  // Scansione rapida all'apertura del menu: timeout basso.
-  // Scansione completa quando premi SCANSIONA: timeout più alto e tentativi extra.
-  int timeoutMs = scansioneProfonda ? 1400 : 650;
-  int n = WiFi.scanNetworks(false, true, false, timeoutMs);
-
-  if (scansioneProfonda && n <= 0 && !giaConnesso) {
-    WiFi.scanDelete();
-    WiFi.disconnect(false, false);
-    delay(180);
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    delay(250);
-    n = WiFi.scanNetworks(false, true, false, 1400);
-  }
-
-  if (scansioneProfonda && n <= 0) {
-    WiFi.scanDelete();
-    delay(120);
-    n = WiFi.scanNetworks(false, true, true, 1400);
   }
 
   if (n > 0) {
@@ -2150,6 +2176,8 @@ void aggiornaListaWifi() {
       aggiungiOpzioneWifi(s, option, stessaReteSalvata);
     }
   }
+
+  WiFi.scanDelete();
 
   if (wifiScanCount == 0) {
     strcpy(wifiRollerOptions, "Nessuna rete trovata");
@@ -2194,14 +2222,74 @@ void aggiornaListaWifi() {
   }
 }
 
+static void wifi_scan_poll_cb(lv_timer_t* timer) {
+  if (!wifi_modal || !wifi_network_roller || !wifi_modal_status_label) {
+    wifiAsyncScanAttiva = false;
+    if (timer) lv_timer_del(timer);
+    wifiScanDeferredTimer = NULL;
+    return;
+  }
+
+  int16_t res = WiFi.scanComplete();
+  if (res == WIFI_SCAN_RUNNING) {
+    return; // Ancora in corso in background, non blocca LVGL!
+  }
+
+  if (timer) lv_timer_del(timer);
+  wifiScanDeferredTimer = NULL;
+  finalizzaRisultatiScansioneWifi(res);
+}
+
+void aggiornaListaWifi() {
+  if (!wifi_modal_status_label || !wifi_network_roller) return;
+
+  bool scansioneProfonda = wifiScanProfondaRichiesta;
+  wifiScanProfondaRichiesta = false;
+
+  lv_label_set_text(wifi_modal_status_label,
+                    scansioneProfonda ? "Scansione completa reti WiFi..." : "Scansione rapida reti WiFi...");
+
+  bool giaConnesso = (WiFi.status() == WL_CONNECTED);
+  preparaRadioWifiPerScansione(giaConnesso);
+
+  int timeoutMs = scansioneProfonda ? 300 : 120; // ms per canale in scansione async
+  // Avvia la scansione in modalità ASINCRONA (true) per non bloccare mai la UI
+  int16_t startRes = WiFi.scanNetworks(true, true, false, timeoutMs);
+  if (startRes == WIFI_SCAN_FAILED) {
+    finalizzaRisultatiScansioneWifi(0);
+    return;
+  }
+
+  wifiAsyncScanAttiva = true;
+  if (wifiScanDeferredTimer) {
+    lv_timer_del(wifiScanDeferredTimer);
+  }
+  wifiScanDeferredTimer = lv_timer_create(wifi_scan_poll_cb, 100, NULL);
+}
+
+static lv_obj_t* wifi_key_btns[3][10] = {{NULL}};
+static lv_obj_t* wifi_key_lbls[3][10] = {{NULL}};
+static lv_obj_t* wifi_mode_btns[3] = {NULL, NULL, NULL};
+static lv_obj_t* wifi_mode_lbls[3] = {NULL, NULL, NULL};
+static char wifi_key_chars[3][10][2];
+
 void clearKeyboardButtons() {
+  wifi_kb_built = false;
+  for (int r = 0; r < 3; r++) {
+    wifi_mode_btns[r] = NULL;
+    wifi_mode_lbls[r] = NULL;
+    for (int c = 0; c < 10; c++) {
+      wifi_key_btns[r][c] = NULL;
+      wifi_key_lbls[r][c] = NULL;
+    }
+  }
   if (!wifi_keyboard_container) return;
   lv_obj_clean(wifi_keyboard_container);
 }
 
 static void wifi_key_cb(lv_event_t* e) {
   const char* key = (const char*)lv_event_get_user_data(e);
-  if (!key) return;
+  if (!key || key[0] == '\0') return;
 
   if (strcmp(key, "DEL") == 0) {
     size_t len = strlen(wifiPasswordBuffer);
@@ -2217,20 +2305,26 @@ static void wifi_key_cb(lv_event_t* e) {
   }
 
   if (strcmp(key, "abc") == 0) {
-    wifiKeyboardMode = 0;
-    buildWifiKeyboard();
+    if (wifiKeyboardMode != 0) {
+      wifiKeyboardMode = 0;
+      buildWifiKeyboard();
+    }
     return;
   }
 
   if (strcmp(key, "ABC") == 0) {
-    wifiKeyboardMode = 1;
-    buildWifiKeyboard();
+    if (wifiKeyboardMode != 1) {
+      wifiKeyboardMode = 1;
+      buildWifiKeyboard();
+    }
     return;
   }
 
   if (strcmp(key, "123") == 0) {
-    wifiKeyboardMode = 2;
-    buildWifiKeyboard();
+    if (wifiKeyboardMode != 2) {
+      wifiKeyboardMode = 2;
+      buildWifiKeyboard();
+    }
     return;
   }
 
@@ -2242,7 +2336,7 @@ static void wifi_key_cb(lv_event_t* e) {
   }
 }
 
-lv_obj_t* creaTastoWifi(const char* text, int x, int y, int w, int h, const char* key, uint32_t borderColor = 0x333333, uint32_t textColor = 0xFFFFFF) {
+lv_obj_t* creaTastoWifi(const char* text, int x, int y, int w, int h, const char* key, lv_obj_t** out_lbl = NULL, uint32_t borderColor = 0x333333, uint32_t textColor = 0xFFFFFF) {
   lv_obj_t* btn = lv_btn_create(wifi_keyboard_container);
   lv_obj_set_size(btn, w, h);
   lv_obj_set_pos(btn, x, y);
@@ -2258,82 +2352,75 @@ lv_obj_t* creaTastoWifi(const char* text, int x, int y, int w, int h, const char
   lv_obj_set_style_text_color(lbl, lv_color_hex(textColor), 0);
   lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
   lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+  if (out_lbl) *out_lbl = lbl;
   return btn;
 }
 
 void buildWifiKeyboard() {
   if (!wifi_keyboard_container) return;
 
-  clearKeyboardButtons();
-
-  if (wifi_keyboard_mode_label) {
-    if (wifiKeyboardMode == 0) lv_label_set_text(wifi_keyboard_mode_label, "");
-    else if (wifiKeyboardMode == 1) lv_label_set_text(wifi_keyboard_mode_label, "");
-    else lv_label_set_text(wifi_keyboard_mode_label, "");
-  }
-
-  const char* row1;
-  const char* row2;
-  const char* row3;
-
+  const char* rows[3];
   if (wifiKeyboardMode == 0) {
-    row1 = "qwertyuiop";
-    row2 = "asdfghjkl";
-    row3 = "zxcvbnm";
+    rows[0] = "qwertyuiop";
+    rows[1] = "asdfghjkl";
+    rows[2] = "zxcvbnm";
   } else if (wifiKeyboardMode == 1) {
-    row1 = "QWERTYUIOP";
-    row2 = "ASDFGHJKL";
-    row3 = "ZXCVBNM";
+    rows[0] = "QWERTYUIOP";
+    rows[1] = "ASDFGHJKL";
+    rows[2] = "ZXCVBNM";
   } else {
-    row1 = "1234567890";
-    row2 = "-_@#$%&*";
-    row3 = ".!?/:+=";
+    rows[0] = "1234567890";
+    rows[1] = "-_@#$%&*";
+    rows[2] = ".!?/:+=";
   }
 
-  // Tastiera full-width per display 800x480:
-  // container circa 724 px di larghezza.
   const int keyW = 65;
   const int keyH = 38;
   const int gap  = 6;
+  const int rowY[3] = {0, 44, 88};
 
-  // Riga 1: 10 tasti, riempie tutta la larghezza.
-  for (int i = 0; row1[i] != '\0'; i++) {
-    static char keys1[10][2];
-    keys1[i][0] = row1[i];
-    keys1[i][1] = '\0';
-    creaTastoWifi(keys1[i], i * (keyW + gap), 0, keyW, keyH, keys1[i]);
+  if (!wifi_kb_built || lv_obj_get_child_cnt(wifi_keyboard_container) == 0) {
+    lv_obj_clean(wifi_keyboard_container);
+    for (int r = 0; r < 3; r++) {
+      for (int c = 0; c < 10; c++) {
+        wifi_key_chars[r][c][0] = '\0';
+        wifi_key_chars[r][c][1] = '\0';
+        wifi_key_btns[r][c] = creaTastoWifi("", 0, rowY[r], keyW, keyH, wifi_key_chars[r][c], &wifi_key_lbls[r][c]);
+      }
+    }
+    wifi_mode_btns[0] = creaTastoWifi("abc",    0,   132, 74,  keyH, "abc", &wifi_mode_lbls[0]);
+    wifi_mode_btns[1] = creaTastoWifi("ABC",    80,  132, 74,  keyH, "ABC", &wifi_mode_lbls[1]);
+    wifi_mode_btns[2] = creaTastoWifi("123",    160, 132, 74,  keyH, "123", &wifi_mode_lbls[2]);
+    creaTastoWifi("SPAZIO", 240, 132, 360, keyH, " ",   NULL, 0x333333, 0xFFFFFF);
+    creaTastoWifi("DEL",    606, 132, 118, keyH, "DEL", NULL, 0xFF6B35, 0xFF6B35);
+    wifi_kb_built = true;
   }
 
-  // Riga 2: centrata.
-  int len2 = strlen(row2);
-  int row2Width = len2 * keyW + (len2 - 1) * gap;
-  int row2X = (724 - row2Width) / 2;
+  // Aggiorna in-place i tasti esistenti senza distruggerli e ricrearli nell'heap LVGL
+  for (int r = 0; r < 3; r++) {
+    int len = strlen(rows[r]);
+    int rowWidth = len * keyW + (len - 1) * gap;
+    int startX = (r == 0) ? 0 : (724 - rowWidth) / 2;
 
-  for (int i = 0; row2[i] != '\0'; i++) {
-    static char keys2[10][2];
-    keys2[i][0] = row2[i];
-    keys2[i][1] = '\0';
-    creaTastoWifi(keys2[i], row2X + i * (keyW + gap), 44, keyW, keyH, keys2[i]);
+    for (int c = 0; c < 10; c++) {
+      if (c < len) {
+        wifi_key_chars[r][c][0] = rows[r][c];
+        wifi_key_chars[r][c][1] = '\0';
+        lv_obj_set_pos(wifi_key_btns[r][c], startX + c * (keyW + gap), rowY[r]);
+        lv_label_set_text(wifi_key_lbls[r][c], wifi_key_chars[r][c]);
+        lv_obj_clear_flag(wifi_key_btns[r][c], LV_OBJ_FLAG_HIDDEN);
+      } else {
+        wifi_key_chars[r][c][0] = '\0';
+        lv_obj_add_flag(wifi_key_btns[r][c], LV_OBJ_FLAG_HIDDEN);
+      }
+    }
   }
 
-  // Riga 3: centrata.
-  int len3 = strlen(row3);
-  int row3Width = len3 * keyW + (len3 - 1) * gap;
-  int row3X = (724 - row3Width) / 2;
-
-  for (int i = 0; row3[i] != '\0'; i++) {
-    static char keys3[10][2];
-    keys3[i][0] = row3[i];
-    keys3[i][1] = '\0';
-    creaTastoWifi(keys3[i], row3X + i * (keyW + gap), 88, keyW, keyH, keys3[i]);
+  for (int m = 0; m < 3; m++) {
+    bool active = (wifiKeyboardMode == m);
+    lv_obj_set_style_border_color(wifi_mode_btns[m], lv_color_hex(active ? 0x4FC3F7 : 0x333333), 0);
+    lv_obj_set_style_text_color(wifi_mode_lbls[m], lv_color_hex(active ? 0x4FC3F7 : 0xFFFFFF), 0);
   }
-
-  // Riga utility finale.
-  creaTastoWifi("abc",    0,   132, 74,  keyH, "abc", wifiKeyboardMode == 0 ? 0x4FC3F7 : 0x333333, wifiKeyboardMode == 0 ? 0x4FC3F7 : 0xFFFFFF);
-  creaTastoWifi("ABC",    80,  132, 74,  keyH, "ABC", wifiKeyboardMode == 1 ? 0x4FC3F7 : 0x333333, wifiKeyboardMode == 1 ? 0x4FC3F7 : 0xFFFFFF);
-  creaTastoWifi("123",    160, 132, 74,  keyH, "123", wifiKeyboardMode == 2 ? 0x4FC3F7 : 0x333333, wifiKeyboardMode == 2 ? 0x4FC3F7 : 0xFFFFFF);
-  creaTastoWifi("SPAZIO", 240, 132, 360, keyH, " ",   0x333333, 0xFFFFFF);
-  creaTastoWifi("DEL",    606, 132, 118, keyH, "DEL", 0xFF6B35, 0xFF6B35);
 }
 
 
@@ -2359,9 +2446,6 @@ static void btn_wifi_rescan_cb(lv_event_t* e) {
     lv_roller_set_options(wifi_network_roller, "Scansione in corso...", LV_ROLLER_MODE_NORMAL);
     lv_roller_set_visible_row_count(wifi_network_roller, 1);
   }
-
-  lv_timer_handler();
-  delay(40);
 
   wifiScanProfondaRichiesta = true;
   aggiornaListaWifi();
@@ -2439,7 +2523,6 @@ static void btn_wifi_connect_cb(lv_event_t* e) {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.disconnect(false, false);
-  delay(150);
   WiFi.begin(ssid, password);
 
   wifiConnessioneInCorso = true;
@@ -2729,12 +2812,15 @@ bool applicaTitoloDaBuffer(bool mostraErrore) {
   return true;
 }
 
+static bool title_kb_built = false;
+
 void resetTitleSettingsRefs() {
   scr_title_settings = NULL;
   title_edit_box = NULL;
   title_edit_label = NULL;
   title_status_label = NULL;
   title_keyboard_container = NULL;
+  title_kb_built = false;
   slider_luminosita = NULL;
   label_antigelo_val = NULL;
   title_sd_indicator_dot = NULL;
@@ -2854,7 +2940,22 @@ static void btn_reset_dati_cb(lv_event_t* e) {
   ESP.restart();
 }
 
+static lv_obj_t* title_key_btns[3][10] = {{NULL}};
+static lv_obj_t* title_key_lbls[3][10] = {{NULL}};
+static lv_obj_t* title_mode_btns[3] = {NULL, NULL, NULL};
+static lv_obj_t* title_mode_lbls[3] = {NULL, NULL, NULL};
+static char title_key_chars[3][10][2];
+
 void clearTitleKeyboardButtons() {
+  title_kb_built = false;
+  for (int r = 0; r < 3; r++) {
+    title_mode_btns[r] = NULL;
+    title_mode_lbls[r] = NULL;
+    for (int c = 0; c < 10; c++) {
+      title_key_btns[r][c] = NULL;
+      title_key_lbls[r][c] = NULL;
+    }
+  }
   if (!title_keyboard_container) return;
   lv_obj_clean(title_keyboard_container);
 }
@@ -2862,7 +2963,7 @@ void clearTitleKeyboardButtons() {
 static void title_key_cb(lv_event_t* e);
 
 lv_obj_t* creaTastoTitle(const char* text, int x, int y, int w, int h, const char* key,
-                         uint32_t borderColor = 0x333333, uint32_t textColor = 0xFFFFFF) {
+                         lv_obj_t** out_lbl = NULL, uint32_t borderColor = 0x333333, uint32_t textColor = 0xFFFFFF) {
   lv_obj_t* btn = lv_btn_create(title_keyboard_container);
   lv_obj_set_size(btn, w, h);
   lv_obj_set_pos(btn, x, y);
@@ -2879,6 +2980,7 @@ lv_obj_t* creaTastoTitle(const char* text, int x, int y, int w, int h, const cha
   lv_obj_set_style_text_color(lbl, lv_color_hex(textColor), 0);
   lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
   lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+  if (out_lbl) *out_lbl = lbl;
 
   return btn;
 }
@@ -2886,74 +2988,74 @@ lv_obj_t* creaTastoTitle(const char* text, int x, int y, int w, int h, const cha
 void buildTitleKeyboard() {
   if (!title_keyboard_container) return;
 
-  clearTitleKeyboardButtons();
-
-  const char* row1;
-  const char* row2;
-  const char* row3;
-
+  const char* rows[3];
   if (titleKeyboardMode == 0) {
-    row1 = "qwertyuiop";
-    row2 = "asdfghjkl";
-    row3 = "zxcvbnm";
+    rows[0] = "qwertyuiop";
+    rows[1] = "asdfghjkl";
+    rows[2] = "zxcvbnm";
   } else if (titleKeyboardMode == 1) {
-    row1 = "QWERTYUIOP";
-    row2 = "ASDFGHJKL";
-    row3 = "ZXCVBNM";
+    rows[0] = "QWERTYUIOP";
+    rows[1] = "ASDFGHJKL";
+    rows[2] = "ZXCVBNM";
   } else {
-    row1 = "1234567890";
-    row2 = "-_@#$%&";
-    row3 = ".!?/:+=";
+    rows[0] = "1234567890";
+    rows[1] = "-_@#$%&";
+    rows[2] = ".!?/:+=";
   }
 
   const int keyW = 48;
   const int keyH = 32;
   const int gap  = 5;
+  const int rowY[3] = {0, 38, 76};
 
-  int len1 = strlen(row1);
-  int row1Width = len1 * keyW + (len1 - 1) * gap;
-  int row1X = (520 - row1Width) / 2;
-
-  for (int i = 0; row1[i] != '\0'; i++) {
-    static char keys1[10][2];
-    keys1[i][0] = row1[i];
-    keys1[i][1] = '\0';
-    creaTastoTitle(keys1[i], row1X + i * (keyW + gap), 0, keyW, keyH, keys1[i]);
+  if (!title_kb_built || lv_obj_get_child_cnt(title_keyboard_container) == 0) {
+    lv_obj_clean(title_keyboard_container);
+    for (int r = 0; r < 3; r++) {
+      for (int c = 0; c < 10; c++) {
+        title_key_chars[r][c][0] = '\0';
+        title_key_chars[r][c][1] = '\0';
+        title_key_btns[r][c] = creaTastoTitle("", 0, rowY[r], keyW, keyH, title_key_chars[r][c], &title_key_lbls[r][c]);
+      }
+    }
+    title_mode_btns[0] = creaTastoTitle("abc",    0,   114, 62,  keyH, "abc", &title_mode_lbls[0]);
+    title_mode_btns[1] = creaTastoTitle("ABC",    67,  114, 62,  keyH, "ABC", &title_mode_lbls[1]);
+    title_mode_btns[2] = creaTastoTitle("123",    134, 114, 62,  keyH, "123", &title_mode_lbls[2]);
+    creaTastoTitle("SPAZIO", 201, 114, 150, keyH, " ",     NULL, 0x333333, 0xFFFFFF);
+    creaTastoTitle("DEL",    356, 114, 76,  keyH, "DEL",   NULL, 0xFF6B35, 0xFF6B35);
+    creaTastoTitle("CHIUDI", 437, 114, 83,  keyH, "CLOSE", NULL, 0xFF3B30, 0xFF3B30);
+    title_kb_built = true;
   }
 
-  int len2 = strlen(row2);
-  int row2Width = len2 * keyW + (len2 - 1) * gap;
-  int row2X = (520 - row2Width) / 2;
+  // Aggiorna in-place i tasti esistenti senza distruggerli e ricrearli nell'heap LVGL
+  for (int r = 0; r < 3; r++) {
+    int len = strlen(rows[r]);
+    int rowWidth = len * keyW + (len - 1) * gap;
+    int startX = (520 - rowWidth) / 2;
 
-  for (int i = 0; row2[i] != '\0'; i++) {
-    static char keys2[10][2];
-    keys2[i][0] = row2[i];
-    keys2[i][1] = '\0';
-    creaTastoTitle(keys2[i], row2X + i * (keyW + gap), 38, keyW, keyH, keys2[i]);
+    for (int c = 0; c < 10; c++) {
+      if (c < len) {
+        title_key_chars[r][c][0] = rows[r][c];
+        title_key_chars[r][c][1] = '\0';
+        lv_obj_set_pos(title_key_btns[r][c], startX + c * (keyW + gap), rowY[r]);
+        lv_label_set_text(title_key_lbls[r][c], title_key_chars[r][c]);
+        lv_obj_clear_flag(title_key_btns[r][c], LV_OBJ_FLAG_HIDDEN);
+      } else {
+        title_key_chars[r][c][0] = '\0';
+        lv_obj_add_flag(title_key_btns[r][c], LV_OBJ_FLAG_HIDDEN);
+      }
+    }
   }
 
-  int len3 = strlen(row3);
-  int row3Width = len3 * keyW + (len3 - 1) * gap;
-  int row3X = (520 - row3Width) / 2;
-
-  for (int i = 0; row3[i] != '\0'; i++) {
-    static char keys3[10][2];
-    keys3[i][0] = row3[i];
-    keys3[i][1] = '\0';
-    creaTastoTitle(keys3[i], row3X + i * (keyW + gap), 76, keyW, keyH, keys3[i]);
+  for (int m = 0; m < 3; m++) {
+    bool active = (titleKeyboardMode == m);
+    lv_obj_set_style_border_color(title_mode_btns[m], lv_color_hex(active ? 0x4FC3F7 : 0x333333), 0);
+    lv_obj_set_style_text_color(title_mode_lbls[m], lv_color_hex(active ? 0x4FC3F7 : 0xFFFFFF), 0);
   }
-
-  creaTastoTitle("abc",    0,   114, 62,  keyH, "abc", titleKeyboardMode == 0 ? 0x4FC3F7 : 0x333333, titleKeyboardMode == 0 ? 0x4FC3F7 : 0xFFFFFF);
-  creaTastoTitle("ABC",    67,  114, 62,  keyH, "ABC", titleKeyboardMode == 1 ? 0x4FC3F7 : 0x333333, titleKeyboardMode == 1 ? 0x4FC3F7 : 0xFFFFFF);
-  creaTastoTitle("123",    134, 114, 62,  keyH, "123", titleKeyboardMode == 2 ? 0x4FC3F7 : 0x333333, titleKeyboardMode == 2 ? 0x4FC3F7 : 0xFFFFFF);
-  creaTastoTitle("SPAZIO", 201, 114, 150, keyH, " ",   0x333333, 0xFFFFFF);
-  creaTastoTitle("DEL",    356, 114, 76,  keyH, "DEL", 0xFF6B35, 0xFF6B35);
-  creaTastoTitle("CHIUDI",  437, 114, 83,  keyH, "CLOSE", 0xFF3B30, 0xFF3B30);
 }
 
 static void title_key_cb(lv_event_t* e) {
   const char* key = (const char*)lv_event_get_user_data(e);
-  if (!key) return;
+  if (!key || key[0] == '\0') return;
 
   if (strcmp(key, "CLOSE") == 0) {
     mostraTitleKeyboard(false);
@@ -2968,20 +3070,26 @@ static void title_key_cb(lv_event_t* e) {
   }
 
   if (strcmp(key, "abc") == 0) {
-    titleKeyboardMode = 0;
-    buildTitleKeyboard();
+    if (titleKeyboardMode != 0) {
+      titleKeyboardMode = 0;
+      buildTitleKeyboard();
+    }
     return;
   }
 
   if (strcmp(key, "ABC") == 0) {
-    titleKeyboardMode = 1;
-    buildTitleKeyboard();
+    if (titleKeyboardMode != 1) {
+      titleKeyboardMode = 1;
+      buildTitleKeyboard();
+    }
     return;
   }
 
   if (strcmp(key, "123") == 0) {
-    titleKeyboardMode = 2;
-    buildTitleKeyboard();
+    if (titleKeyboardMode != 2) {
+      titleKeyboardMode = 2;
+      buildTitleKeyboard();
+    }
     return;
   }
 
@@ -3291,17 +3399,6 @@ void buildMainUI() {
   lv_obj_set_style_bg_color(scr_main, lv_color_hex(0x07090D), 0);
   lv_obj_clear_flag(scr_main, LV_OBJ_FLAG_SCROLLABLE);
 
-  // Sfondo con pannello centrale: look più pulito, meno elementi sovrapposti.
-  lv_obj_t* bg_glow = lv_obj_create(scr_main);
-  lv_obj_set_size(bg_glow, 520, 360);
-  lv_obj_set_pos(bg_glow, 140, 55);
-  lv_obj_set_style_bg_opa(bg_glow, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_opa(bg_glow, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(bg_glow, 0, 0);
-  lv_obj_set_style_radius(bg_glow, 34, 0);
-  lv_obj_set_style_pad_all(bg_glow, 0, 0);
-  lv_obj_clear_flag(bg_glow, LV_OBJ_FLAG_SCROLLABLE);
-
   lv_obj_t* header = lv_obj_create(scr_main);
   lv_obj_set_size(header, 800, 58);
   lv_obj_set_pos(header, 0, 0);
@@ -3499,29 +3596,6 @@ void buildMainUI() {
   lv_obj_add_flag(label_schedule_subtext, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(label_schedule_subtext, btn_programma_cb, LV_EVENT_CLICKED, NULL);
 
-  // Vecchio pulsante ORARI eliminato dalla UI:
-  // la card programma orario ora apre direttamente il menu delle fasce.
-  // Manteniamo un riferimento nascosto per compatibilità con aggiornaStatoGraficoOra().
-  btn_programma = lv_btn_create(scr_main);
-  lv_obj_set_size(btn_programma, 1, 1);
-  lv_obj_set_pos(btn_programma, -20, -20);
-  lv_obj_set_style_opa(btn_programma, LV_OPA_TRANSP, 0);
-  lv_obj_add_flag(btn_programma, LV_OBJ_FLAG_HIDDEN);
-
-  label_programma_btn = lv_label_create(btn_programma);
-  lv_label_set_text(label_programma_btn, "ORARI");
-  lv_obj_add_flag(label_programma_btn, LV_OBJ_FLAG_HIDDEN);
-
-  // Vecchio pulsante power: mantenuto nascosto per compatibilità con aggiornaUI().
-  btn_onoff = lv_btn_create(scr_main);
-  lv_obj_set_size(btn_onoff, 1, 1);
-  lv_obj_set_pos(btn_onoff, -20, -20);
-  lv_obj_set_style_opa(btn_onoff, LV_OPA_TRANSP, 0);
-  lv_obj_add_flag(btn_onoff, LV_OBJ_FLAG_HIDDEN);
-
-  label_onoff = lv_label_create(btn_onoff);
-  lv_label_set_text(label_onoff, "OFF");
-
   // ── Centro: termostato principale ───────────────────────────
   arc_bg = lv_arc_create(scr_main);
   lv_obj_set_size(arc_bg, 360, 360);
@@ -3573,16 +3647,14 @@ void buildMainUI() {
   lv_obj_set_style_bg_color(arc_target, lv_color_hex(0x4A4A4A), LV_PART_KNOB);
   lv_obj_set_style_bg_opa(arc_target, LV_OPA_COVER, LV_PART_KNOB);
   lv_obj_set_style_pad_all(arc_target, 10, LV_PART_KNOB);
-  lv_obj_set_style_shadow_width(arc_target, 18, LV_PART_KNOB);
-  lv_obj_set_style_shadow_color(arc_target, lv_color_hex(0x4A4A4A), LV_PART_KNOB);
-  lv_obj_set_style_shadow_opa(arc_target, LV_OPA_30, LV_PART_KNOB);
+  lv_obj_set_style_shadow_width(arc_target, 0, LV_PART_KNOB);
   lv_obj_add_event_cb(arc_target, arc_target_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
   lv_obj_t* center_chip = lv_obj_create(scr_main);
   lv_obj_set_size(center_chip, 268, 268);
   lv_obj_set_pos(center_chip, 266, 101);
-  lv_obj_set_style_bg_color(center_chip, lv_color_hex(0x101827), 0);
-  lv_obj_set_style_bg_opa(center_chip, LV_OPA_90, 0);
+  lv_obj_set_style_bg_color(center_chip, lv_color_hex(0x0F1725), 0);
+  lv_obj_set_style_bg_opa(center_chip, LV_OPA_COVER, 0);
   lv_obj_set_style_border_color(center_chip, lv_color_hex(0x2A3B52), 0);
   lv_obj_set_style_border_width(center_chip, 1, 0);
   lv_obj_set_style_radius(center_chip, 134, 0);
@@ -4055,14 +4127,22 @@ void setup() {
   lcd.setBrightness(displayBrightness);
   lcd.setRotation(0);
 
-  // Buffer LVGL più leggero: evita di saturare la RAM interna.
-  // Su ESP32-S3 senza PSRAM, buffer troppo grandi possono causare render parziale
-  // della UI, visibile come sola sezione superiore dello schermo.
-  size_t px_count = 800 * 10; 
+  // Buffer LVGL a 12 righe in RAM interna DMA (multiplo delle micro-fasce da 4 righe di my_disp_flush).
+  size_t px_count = 800 * 12; 
   size_t buffer_size = px_count * sizeof(lv_color_t); 
   buf1 = (lv_color_t*)heap_caps_malloc(buffer_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
   buf2 = (lv_color_t*)heap_caps_malloc(buffer_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
   if (buf1 == NULL || buf2 == NULL) {
+    if (buf1) { heap_caps_free(buf1); buf1 = NULL; }
+    if (buf2) { heap_caps_free(buf2); buf2 = NULL; }
+    px_count = 800 * 10;
+    buffer_size = px_count * sizeof(lv_color_t);
+    buf1 = (lv_color_t*)heap_caps_malloc(buffer_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    buf2 = (lv_color_t*)heap_caps_malloc(buffer_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  }
+  if (buf1 == NULL || buf2 == NULL) {
+    if (buf1) { heap_caps_free(buf1); buf1 = NULL; }
+    if (buf2) { heap_caps_free(buf2); buf2 = NULL; }
     px_count = 800 * 5;
     buffer_size = px_count * sizeof(lv_color_t);
     buf1 = (lv_color_t*)heap_caps_malloc(buffer_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
@@ -4085,11 +4165,6 @@ void setup() {
   indev_drv.read_cb = my_touch_read;
   lv_indev_drv_register(&indev_drv);
 
-  lvgl_timer = timerBegin(0, 80, true); 
-  timerAttachInterrupt(lvgl_timer, &onTimer, true);
-  timerAlarmWrite(lvgl_timer, 1000, true); 
-  timerAlarmEnable(lvgl_timer);
-
   buildMainUI();
   controllaOraSistema(true);
   aggiornaUI();
@@ -4110,12 +4185,6 @@ void setup() {
 
     int tentativi = 0;
     while (WiFi.status() != WL_CONNECTED && tentativi < 8) {
-      uint32_t t = 0;
-      portENTER_CRITICAL(&timerMux);
-      t = lvgl_tick_ms;
-      lvgl_tick_ms = 0;
-      portEXIT_CRITICAL(&timerMux);
-      if (t > 0) lv_tick_inc(t);
       lv_timer_handler();
       delay(250);
       tentativi++;
@@ -4146,32 +4215,48 @@ void setup() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
     bool risc = riscaldamento;
     bool tOn  = termostatoOn;
-    String bc = risc ? "#FF6B35" : "#4FC3F7";
+    const char* bc = risc ? "#FF6B35" : "#4FC3F7";
 
-    String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Termostato</title><style>...</style></head><body>";
-    html += "<h1>" + String(titleLabel) + "</h1>";
-    html += "<div class='circle' style='border-color:" + bc + "'><div class='lbl'>ATTUALE</div><div class='temp cyan'>" + String(tempAttuale, 1) + "</div><div class='unit'>°C</div></div>";
-    html += "<div class='card'><div class='lbl'>TARGET TEMPERATURA</div><div style='font-size:32px;margin:8px;color:" + bc + "'>" + String(tempTarget, 1) + "°C</div>";
-    html += "<div style='font-size:13px;color:#aaa;margin-bottom:8px'>Antigelo: " + String(tempAntigelo, 1) + "°C</div>";
-    html += "<div class='row'><button class='btn btn-down' onclick='fetch(\"/giu\").then(()=>location.reload())'>- 0.5°</button><button class='btn btn-up' onclick='fetch(\"/su\").then(()=>location.reload())'>+ 0.5°</button></div></div>";
-    html += "<div class='card'><div class='row'>";
+    String html;
+    html.reserve(1200);
+    html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Termostato</title><style>...</style></head><body>";
+    html += "<h1>";
+    html += titleLabel;
+    html += "</h1><div class='circle' style='border-color:";
+    html += bc;
+    html += "'><div class='lbl'>ATTUALE</div><div class='temp cyan'>";
+    html += String(tempAttuale, 1);
+    html += "</div><div class='unit'>°C</div></div><div class='card'><div class='lbl'>TARGET TEMPERATURA</div><div style='font-size:32px;margin:8px;color:";
+    html += bc;
+    html += "'>";
+    html += String(tempTarget, 1);
+    html += "°C</div><div style='font-size:13px;color:#aaa;margin-bottom:8px'>Antigelo: ";
+    html += String(tempAntigelo, 1);
+    html += "°C</div><div class='row'><button class='btn btn-down' onclick='fetch(\"/giu\").then(()=>location.reload())'>- 0.5°</button><button class='btn btn-up' onclick='fetch(\"/su\").then(()=>location.reload())'>+ 0.5°</button></div></div><div class='card'><div class='row'>";
     
     if (tOn) html += "<button class='btn btn-off' onclick='fetch(\"/off\").then(()=>location.reload())'>⏻ Spegni</button>";
     else html += "<button class='btn btn-on' onclick='fetch(\"/on\").then(()=>location.reload())'>⏻ Accendi</button>";
     
-    html += "</div><div style='margin:6px 0'>Termostato: <b style='color:" + String(tOn?"#4FC3F7":"#FF6B35") + "'>" + String(tOn?"ON":"OFF") + "</b></div>";
-    html += "<div>Umidità: <b class='cyan'>" + String(umidAttuale, 0) + "%</b> | Pressione: <b class='cyan'>" + String(pressAttuale, 0) + " hPa</b></div>";
-    html += "<div style='margin-top:8px'>Riscaldamento: <span class='" + String(risc?"on'>🔥 ATTIVO":"off'>○ STANDBY") + "</span></div></div></body></html>";
+    html += "</div><div style='margin:6px 0'>Termostato: <b style='color:";
+    html += (tOn ? "#4FC3F7" : "#FF6B35");
+    html += "'>";
+    html += (tOn ? "ON" : "OFF");
+    html += "</b></div><div>Umidità: <b class='cyan'>";
+    html += String(umidAttuale, 0);
+    html += "%</b> | Pressione: <b class='cyan'>";
+    html += String(pressAttuale, 0);
+    html += " hPa</b></div><div style='margin-top:8px'>Riscaldamento: <span class='";
+    html += (risc ? "on'>🔥 ATTIVO" : "off'>○ STANDBY");
+    html += "</span></div></div></body></html>";
     
     request->send(200, "text/html", html);
   });
 
-  // Gestione comandi
+  // Gestione comandi (Thread-safe: delegano l'aggiornamento LVGL al loop principale su Core 1)
   server.on("/su", HTTP_GET, [](AsyncWebServerRequest* request) { 
     if (tempTarget < TARGET_MAX) {
         tempTarget = constrain(tempTarget + 0.5f, TARGET_MIN, TARGET_MAX); 
-        aggiornaUI(); 
-        aggiornaLogica(); 
+        webSyncPending = true;
     } 
     request->send(200, "text/plain", "OK"); 
   });
@@ -4179,8 +4264,7 @@ void setup() {
   server.on("/giu", HTTP_GET, [](AsyncWebServerRequest* request) { 
     if (tempTarget > TARGET_MIN) {
         tempTarget = constrain(tempTarget - 0.5f, TARGET_MIN, TARGET_MAX); 
-        aggiornaUI(); 
-        aggiornaLogica(); 
+        webSyncPending = true;
     } 
     request->send(200, "text/plain", "OK"); 
   });
@@ -4188,21 +4272,25 @@ void setup() {
   server.on("/on", HTTP_GET, [](AsyncWebServerRequest* request) { 
     termostatoOn = true; 
     overrideManuale = true; 
-    aggiornaUI(); 
-    aggiornaLogica(); 
+    webSyncPending = true;
     request->send(200, "text/plain", "OK"); 
   });
 
   server.on("/off", HTTP_GET, [](AsyncWebServerRequest* request) { 
     termostatoOn = false; 
     overrideManuale = true; 
-    aggiornaUI(); 
-    aggiornaLogica(); 
+    webSyncPending = true;
     request->send(200, "text/plain", "OK"); 
   });
 
   server.on("/stato", HTTP_GET, [](AsyncWebServerRequest* request) {
-    String json = "{\"temp\":" + String(tempAttuale, 1) + ",\"umid\":" + String(umidAttuale, 0) + ",\"press\":" + String(pressAttuale, 0) + ",\"target\":" + String(tempTarget, 1) + ",\"antigelo\":" + String(tempAntigelo, 1) + ",\"risc\":" + String(riscaldamento ? "true" : "false") + ",\"on\":" + String(termostatoOn ? "true" : "false") + ",\"ora_valida\":" + String(oraSistemaValida ? "true" : "false") + "}";
+    char json[200];
+    snprintf(json, sizeof(json),
+             "{\"temp\":%.1f,\"umid\":%.0f,\"press\":%.0f,\"target\":%.1f,\"antigelo\":%.1f,\"risc\":%s,\"on\":%s,\"ora_valida\":%s}",
+             tempAttuale, umidAttuale, pressAttuale, tempTarget, tempAntigelo,
+             riscaldamento ? "true" : "false",
+             termostatoOn ? "true" : "false",
+             oraSistemaValida ? "true" : "false");
     request->send(200, "application/json", json);
   });
 
@@ -4218,7 +4306,7 @@ void setup() {
     html += "</p>";
 
     html += "<h2>/config.txt</h2><pre>";
-    html += SD.exists(CONFIG_PATH) ? leggiFileComeStringa(CONFIG_PATH) : "ASSENTE";
+    html += SD.exists(CONFIG_PATH) ? mascheraPasswordInConfig(leggiFileComeStringa(CONFIG_PATH)) : "ASSENTE";
     html += "</pre>";
 
     html += "<h2>/fasce.txt</h2><pre>";
@@ -4363,14 +4451,15 @@ void aggiornaFeedbackConnessioneWifi() {
 
 
 void loop() {
-  uint32_t t = 0;
-  portENTER_CRITICAL(&timerMux);
-  t = lvgl_tick_ms;
-  lvgl_tick_ms = 0;
-  portEXIT_CRITICAL(&timerMux); 
-  if (t > 0) lv_tick_inc(t);
   lv_timer_handler();
   aggiornaFeedbackConnessioneWifi();
+
+  if (webSyncPending) {
+    webSyncPending = false;
+    aggiornaTargetUIRapida();
+    aggiornaLogica();
+    aggiornaUI();
+  }
 
   if (targetLogicPending && (millis() - ultimoCambioTargetMs >= TARGET_LOGIC_DEBOUNCE_MS)) {
     targetLogicPending = false;
@@ -4419,5 +4508,8 @@ void loop() {
     aggiornaLogica();
     aggiornaUI();
   }
-  delay(2);
+  // Quando il display è spento in standby, rallentiamo il ciclo a 25ms (~40Hz)
+  // per ridurre consumi e riscaldamento della CPU (che può influenzare il BME280),
+  // pur mantenendo immediato il risveglio al tocco.
+  delay(displayAcceso ? 2 : 25);
 }
