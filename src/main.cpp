@@ -11,6 +11,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <esp_system.h>
+#include <esp_task_wdt.h>
 #include <esp32s3/rom/cache.h>
 
 char ssid[64]       = "SSID";
@@ -62,6 +63,14 @@ bool overrideManuale = false;
 #define PIN_BME_SCL 18
 #define BME_ADDR_PRIMARY   0x76
 #define BME_ADDR_SECONDARY 0x77
+
+#if USE_RELE && USE_BME280 && ((PIN_RELE == PIN_BME_SDA) || (PIN_RELE == PIN_BME_SCL))
+  #error "CONFLITTO HARDWARE CRITICO: PIN_RELE coincide con PIN_BME_SDA o PIN_BME_SCL! Assegna un GPIO diverso a PIN_RELE prima di attivare sia USE_RELE che USE_BME280."
+#endif
+
+// Timeout del Watchdog Hardware (in secondi): se loop() si blocca oltre questa soglia,
+// l'ESP32-S3 si riavvia portando subito il relè caldaia in stato sicuro (OFF).
+#define WDT_TIMEOUT_SECONDS 15
 
 Adafruit_BME280 bme;
 bool bmePresente = false;
@@ -490,10 +499,13 @@ void setRiscaldamento(bool acceso) {
 }
 
 void inizializzaRele() {
+  // Imposta il livello di uscita sicuro (OFF) prima di abilitare il driver OUTPUT
+  // per evitare glitch sul relè al boot o dopo un reset da Watchdog.
+  setReleHardware(false);
 #if USE_RELE
   pinMode(PIN_RELE, OUTPUT);
-#endif
   setReleHardware(false);
+#endif
   riscaldamento = false;
 }
 
@@ -4299,6 +4311,9 @@ String buildLoginHtml(const char* errorMsg = nullptr) {
 }
 
 void setup() {
+  // Priorità assoluta al boot: mettere subito il relè caldaia in stato sicuro (OFF)
+  inizializzaRele();
+
   Serial.begin(115200);
   inizializzaCredenzialiAPDefault();
 
@@ -4310,7 +4325,6 @@ void setup() {
     aggiornaCacheDiagnosticaSD();
     Serial.println("AVVISO: avvio senza SD. Config e fasce non saranno persistenti.");
   }
-  inizializzaRele();
   inizializzaBME280();
 
   lcd.init();
@@ -4610,6 +4624,12 @@ server.begin();
   }
 
   aggiornaWifiHeader();
+
+  // Attiva Hardware Task Watchdog sul loop() principale (Core 1):
+  // se un bus o il firmware si blocca per più di WDT_TIMEOUT_SECONDS, forza il riavvio
+  // riportando immediatamente il relè caldaia in OFF all'inizio di setup().
+  esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+  esp_task_wdt_add(NULL);
   }
 
 
@@ -4713,6 +4733,7 @@ void aggiornaFeedbackConnessioneWifi() {
 
 
 void loop() {
+  esp_task_wdt_reset();
   lv_timer_handler();
   aggiornaFeedbackConnessioneWifi();
 
