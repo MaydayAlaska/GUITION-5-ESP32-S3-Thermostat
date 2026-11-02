@@ -183,6 +183,7 @@ unsigned long ultimoCambioTargetMs = 0;
 const unsigned long TARGET_LOGIC_DEBOUNCE_MS = 140;
 const unsigned long TARGET_UI_MIN_INTERVAL_MS = 32;
 volatile bool webSyncPending = false;
+volatile bool webSdReinitPending = false;
 
 AsyncWebServer server(80);
 bool webServerAvviato = false;
@@ -1341,6 +1342,9 @@ bool sdUltimoSaveFasceOk  = false;
 bool sdConfigCaricataOk   = false;
 bool sdFasceCaricateOk    = false;
 int  sdNumeroFasceCaricate = 0;
+String sdCacheConfigMascherata = "ASSENTE";
+String sdCacheFasce            = "ASSENTE";
+void aggiornaCacheDiagnosticaSD();
 
 void setSdStatus(const char* msg) {
   strncpy(sdUltimoMessaggio, msg, sizeof(sdUltimoMessaggio) - 1);
@@ -1498,6 +1502,20 @@ String leggiFileComeStringa(const char* path) {
 
   file.close();
   return content;
+}
+
+void aggiornaCacheDiagnosticaSD() {
+  if (!sdPronta) {
+    sdCacheConfigMascherata = "SD NON PRONTA";
+    sdCacheFasce            = "SD NON PRONTA";
+    return;
+  }
+  sdCacheConfigMascherata = SD.exists(CONFIG_PATH)
+                              ? mascheraPasswordInConfig(leggiFileComeStringa(CONFIG_PATH))
+                              : "ASSENTE";
+  sdCacheFasce = SD.exists(FASCE_PATH)
+                   ? leggiFileComeStringa(FASCE_PATH)
+                   : "ASSENTE";
 }
 
 bool scriviStringaSuFileSicuro(const char* path, const String& content) {
@@ -1670,6 +1688,7 @@ bool saveConfig() {
 
   if (sdUltimoSaveConfigOk) {
     setSdStatus("SD OK: config salvata.");
+    sdCacheConfigMascherata = mascheraPasswordInConfig(content);
   } else {
     setSdStatus("ERRORE SD: salvataggio config fallito.");
   }
@@ -1785,6 +1804,8 @@ void loadConfig() {
   if (riscriviConfig) {
     Serial.println("SD: config incompleta o vecchio formato, riscrivo /config.txt.");
     saveConfig();
+  } else {
+    sdCacheConfigMascherata = mascheraPasswordInConfig(leggiFileComeStringa(CONFIG_PATH));
   }
 
   setSdStatus("SD OK: config caricata.");
@@ -1837,6 +1858,7 @@ bool saveFasce() {
     char msg[120];
     snprintf(msg, sizeof(msg), "SD OK: fasce salvate. Numero fasce: %d", salvate);
     setSdStatus(msg);
+    sdCacheFasce = content;
   } else {
     setSdStatus("ERRORE SD: salvataggio fasce fallito.");
   }
@@ -1907,6 +1929,8 @@ bool loadFasceTxt() {
   if (formatoDaRipulire) {
     Serial.println("SD: /fasce.txt contiene righe non valide, riscrivo pulito.");
     saveFasce();
+  } else {
+    sdCacheFasce = leggiFileComeStringa(FASCE_PATH);
   }
 
   char msg[120];
@@ -4229,7 +4253,9 @@ void setup() {
   if (inizializzaSD()) {
     loadConfig();
     loadFasce();
+    aggiornaCacheDiagnosticaSD();
   } else {
+    aggiornaCacheDiagnosticaSD();
     Serial.println("AVVISO: avvio senza SD. Config e fasce non saranno persistenti.");
   }
   inizializzaRele();
@@ -4487,14 +4513,17 @@ void setup() {
     html += sdPronta ? "SI" : "NO";
     html += "</p><p>Ultimo messaggio: ";
     html += String(sdUltimoMessaggio);
+    if (webSdReinitPending) {
+      html += " <b>(Reinizializzazione in corso...)</b>";
+    }
     html += "</p><form method='POST' action='/sd-init'><button type='submit'>Reinizializza SD</button></form>";
 
     html += "<h2>/config.txt</h2><pre>";
-    html += SD.exists(CONFIG_PATH) ? mascheraPasswordInConfig(leggiFileComeStringa(CONFIG_PATH)) : "ASSENTE";
+    html += sdPronta ? sdCacheConfigMascherata : "SD NON PRONTA";
     html += "</pre>";
 
     html += "<h2>/fasce.txt</h2><pre>";
-    html += SD.exists(FASCE_PATH) ? leggiFileComeStringa(FASCE_PATH) : "ASSENTE";
+    html += sdPronta ? sdCacheFasce : "SD NON PRONTA";
     html += "</pre>";
 
     html += "</body></html>";
@@ -4504,19 +4533,15 @@ void setup() {
 
   server.on("/sd-init", HTTP_POST, [](AsyncWebServerRequest* request) {
     if (!richiediAuthWeb(request, true)) return;
-    sdPronta = false;
-    bool ok = inizializzaSD();
+    webSdReinitPending = true;
 
-    String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>SD Init</title>";
+    String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta http-equiv='refresh' content='2;url=/sd'><title>SD Init</title>";
     html += "<style>body{background:#111;color:#ddd;font-family:monospace;padding:20px}pre{background:#222;padding:14px;border-radius:10px;white-space:pre-wrap}</style></head><body>";
-    html += "<h1>Reinizializzazione SD</h1>";
-    html += "<p>Esito: ";
-    html += ok ? "OK" : "ERRORE";
-    html += "</p><p>";
-    html += String(sdUltimoMessaggio);
-    html += "</p><p><a href='/sd'>Vai a diagnostica SD</a></p></body></html>";
+    html += "<h1>Reinizializzazione SD avviata</h1>";
+    html += "<p>Operazione delegata in modo sicuro al loop principale (Core 1).</p>";
+    html += "<p>Reindirizzamento automatico a <a href='/sd'>/sd</a> tra 2 secondi...</p></body></html>";
 
-    request->send(200, "text/html", html);
+    request->send(202, "text/html", html);
   });
 
 server.begin();
@@ -4644,6 +4669,19 @@ void loop() {
     aggiornaTargetUIRapida();
     aggiornaLogica();
     aggiornaUI();
+  }
+
+  if (webSdReinitPending) {
+    webSdReinitPending = false;
+    sdPronta = false;
+    if (inizializzaSD()) {
+      loadConfig();
+      loadFasce();
+      aggiornaCacheDiagnosticaSD();
+      aggiornaUI();
+    } else {
+      aggiornaCacheDiagnosticaSD();
+    }
   }
 
   if (targetLogicPending && (millis() - ultimoCambioTargetMs >= TARGET_LOGIC_DEBOUNCE_MS)) {
