@@ -1516,6 +1516,25 @@ bool assicuraSDPronta() {
   return inizializzaSD();
 }
 
+String escapeHtml(const String& in) {
+  String out;
+  out.reserve(in.length() + 16);
+  for (size_t i = 0; i < in.length(); i++) {
+    char c = in.charAt(i);
+    switch (c) {
+      case '&':  out += "&amp;";  break;
+      case '<':  out += "&lt;";   break;
+      case '>':  out += "&gt;";   break;
+      case '"':  out += "&quot;"; break;
+      case '\'': out += "&#39;";  break;
+      default:   out += c;        break;
+    }
+  }
+  return out;
+}
+
+const size_t MAX_SD_READ_BYTES = 4096;
+
 String leggiFileComeStringa(const char* path) {
   String content = "";
 
@@ -1526,17 +1545,18 @@ String leggiFileComeStringa(const char* path) {
   if (!file) return content;
 
   size_t sz = file.size();
-  if (sz > 0 && sz <= 4096) {
-    content.reserve(sz + 1);
-    while (file.available()) {
+  size_t toRead = (sz > MAX_SD_READ_BYTES) ? MAX_SD_READ_BYTES : sz;
+  if (toRead > 0) {
+    content.reserve(toRead + 1);
+    size_t remaining = toRead;
+    while (file.available() && remaining > 0) {
       char buf[128];
-      size_t n = file.readBytes(buf, sizeof(buf) - 1);
+      size_t chunk = (remaining < sizeof(buf) - 1) ? remaining : (sizeof(buf) - 1);
+      size_t n = file.readBytes(buf, chunk);
+      if (n == 0) break;
       buf[n] = '\0';
       content += buf;
-    }
-  } else {
-    while (file.available()) {
-      content += (char)file.read();
+      remaining -= n;
     }
   }
 
@@ -4296,11 +4316,11 @@ String buildLoginHtml(const char* errorMsg = nullptr) {
          "button:active{opacity:0.85}"
          ".err{background:#2E1518;border:1px solid #FF6B35;color:#FF8A65;padding:10px;border-radius:8px;font-size:13px;margin-bottom:14px}"
          "</style></head><body><div class='box'><h1>";
-  html += titleLabel;
+  html += escapeHtml(String(titleLabel));
   html += "</h1><div class='sub'>Accesso Pannello di Controllo</div>";
   if (errorMsg && strlen(errorMsg) > 0) {
     html += "<div class='err'>";
-    html += errorMsg;
+    html += escapeHtml(String(errorMsg));
     html += "</div>";
   }
   html += "<form method='POST' action='/login'>"
@@ -4489,7 +4509,7 @@ void setup() {
            ".logout{background:transparent;border:1px solid #333B4D;color:#9BA3B0;font-size:12px;padding:7px 14px;border-radius:8px;cursor:pointer;margin-top:8px}"
            "</style></head><body>";
     html += "<h1>";
-    html += titleLabel;
+    html += escapeHtml(String(titleLabel));
     html += "</h1><div class='circle' style='border-color:";
     html += bc;
     html += "'><div class='lbl'>ATTUALE</div><div class='temp cyan'>";
@@ -4578,18 +4598,18 @@ void setup() {
     html += "<p>SD pronta: ";
     html += sdPronta ? "SI" : "NO";
     html += "</p><p>Ultimo messaggio: ";
-    html += String(sdUltimoMessaggio);
+    html += escapeHtml(String(sdUltimoMessaggio));
     if (webSdReinitPending) {
       html += " <b>(Reinizializzazione in corso...)</b>";
     }
     html += "</p><form method='POST' action='/sd-init'><button type='submit'>Reinizializza SD</button></form>";
 
     html += "<h2>/config.txt</h2><pre>";
-    html += sdPronta ? sdCacheConfigMascherata : "SD NON PRONTA";
+    html += sdPronta ? escapeHtml(sdCacheConfigMascherata) : "SD NON PRONTA";
     html += "</pre>";
 
     html += "<h2>/fasce.txt</h2><pre>";
-    html += sdPronta ? sdCacheFasce : "SD NON PRONTA";
+    html += sdPronta ? escapeHtml(sdCacheFasce) : "SD NON PRONTA";
     html += "</pre>";
 
     html += "</body></html>";
